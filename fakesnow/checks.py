@@ -109,15 +109,6 @@ def _missing_qualifiers(node: exp.Table) -> tuple[bool, bool]:
             # "USE SCHEMA"
             no_database = not node.args.get("db")
             no_schema = False
-        elif parent_kind.name.upper() in {"WAREHOUSE", "ROLE"}:
-            # "USE WAREHOUSE" / "USE ROLE" - warehouse and role are
-            # account-level resources, not database/schema-scoped objects,
-            # so neither qualifier is required. dbt-snowflake's
-            # dynamic_table materialization issues USE WAREHOUSE before
-            # each CREATE; pre-hooks and a future dbt-snowflake may issue
-            # USE ROLE the same way. Same shape as the USE DATABASE arm.
-            no_database = False
-            no_schema = False
         else:
             raise AssertionError(f"Unexpected parent kind: {parent_kind.name}")
 

@@ -1,7 +1,6 @@
 import sqlglot
 
 from fakesnow.transforms.ddl import alter_table_add_multiple_columns, alter_table_strip_cluster_by
-from fakesnow.transforms.transforms import create_temp_view_strip_qualifier
 
 
 def test_alter_table_add_multiple_columns() -> None:
@@ -65,71 +64,3 @@ def test_alter_table_strip_cluster_by() -> None:
     # Regular ALTER TABLE should not be affected
     regular_alter = sqlglot.parse_one("alter table table1 add column name varchar(20)")
     assert regular_alter.transform(alter_table_strip_cluster_by).sql() != success_sql
-
-
-def test_create_temp_view_strip_qualifier() -> None:
-    # 3-part name on TEMP VIEW (the dbt incremental rebuild pattern) -> qualifier stripped
-    assert (
-        sqlglot.parse_one(
-            "CREATE OR REPLACE TEMPORARY VIEW mydb.gold.test_view__dbt_tmp AS SELECT 1 AS col",
-            read="snowflake",
-        )
-        .transform(create_temp_view_strip_qualifier)
-        .sql()
-        == "CREATE OR REPLACE TEMPORARY VIEW test_view__dbt_tmp AS SELECT 1 AS col"
-    )
-
-    # 2-part name on TEMP VIEW (db omitted) -> qualifier stripped.
-    # NB: sqlglot canonicalises ``TEMP`` -> ``TEMPORARY`` on emit.
-    assert (
-        sqlglot.parse_one(
-            "CREATE OR REPLACE TEMP VIEW gold.test_view__dbt_tmp AS SELECT 1 AS col",
-            read="snowflake",
-        )
-        .transform(create_temp_view_strip_qualifier)
-        .sql()
-        == "CREATE OR REPLACE TEMPORARY VIEW test_view__dbt_tmp AS SELECT 1 AS col"
-    )
-
-    # CREATE (no OR REPLACE) TEMP VIEW with qualifier -> still stripped
-    assert (
-        sqlglot.parse_one(
-            "CREATE TEMPORARY VIEW mydb.gold.x__dbt_tmp AS SELECT 1",
-            read="snowflake",
-        )
-        .transform(create_temp_view_strip_qualifier)
-        .sql()
-        == "CREATE TEMPORARY VIEW x__dbt_tmp AS SELECT 1"
-    )
-
-    # Already-unqualified TEMP VIEW -> unchanged
-    unqualified = "CREATE OR REPLACE TEMPORARY VIEW x__dbt_tmp AS SELECT 1"
-    assert (
-        sqlglot.parse_one(unqualified, read="snowflake").transform(create_temp_view_strip_qualifier).sql()
-        == unqualified
-    )
-
-    # Non-temp VIEW with qualifier -> unchanged (we only target TEMP VIEW)
-    persistent = "CREATE OR REPLACE VIEW mydb.gold.x AS SELECT 1"
-    assert (
-        sqlglot.parse_one(persistent, read="snowflake").transform(create_temp_view_strip_qualifier).sql()
-        == persistent
-    )
-
-    # CREATE TEMP TABLE (not a view) with qualifier -> unchanged (out of scope)
-    temp_table = "CREATE OR REPLACE TEMPORARY TABLE mydb.gold.x AS SELECT 1"
-    assert (
-        sqlglot.parse_one(temp_table, read="snowflake").transform(create_temp_view_strip_qualifier).sql()
-        == temp_table
-    )
-
-    # Quoted-identifier 3-part TEMP VIEW -> qualifier stripped, identifier preserved
-    assert (
-        sqlglot.parse_one(
-            'CREATE OR REPLACE TEMPORARY VIEW "mydb"."gold"."x__dbt_tmp" AS SELECT 1',
-            read="snowflake",
-        )
-        .transform(create_temp_view_strip_qualifier)
-        .sql()
-        == 'CREATE OR REPLACE TEMPORARY VIEW "x__dbt_tmp" AS SELECT 1'
-    )

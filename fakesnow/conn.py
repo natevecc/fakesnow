@@ -83,7 +83,7 @@ class FakeSnowflakeConnection:
         # source dict after construction has no effect. The kwarg wins when explicitly
         # provided (even when False), otherwise the session_parameter value is used.
         # See ADR docs/decisions/2026-04-26-fakesnow-first-fix.md.
-        # TODO(phrase-fork): remove if/when fakesnow upstream lands a built-in opt-in.
+        # TODO: remove if/when fakesnow upstream lands a built-in opt-in.
         session_parameters = kwargs.get("session_parameters") or {}
         kwarg_value = kwargs.get("preserve_identifier_case")
         if kwarg_value is not None:

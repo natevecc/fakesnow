@@ -11,7 +11,7 @@ dependencies = [
     "duckdb~=1.5.2",
     "pyarrow",
     "snowflake-connector-python",
-    "sqlglot>=30.2",
+    "sqlglot~=30.6",
 ]
 
 [project.urls]
@@ -55,6 +55,9 @@ server = ["starlette", "uvicorn"]
 [build-system]
 requires = ["setuptools~=82.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+sqlglot = { git = "https://github.com/natevecc/sqlglot.git", rev = "a68efb4b6aef87e0efd0c89e4efa60a7855941ba" }
 
 [tool.setuptools.packages.find]
 where = ["."]

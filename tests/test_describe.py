@@ -318,9 +318,9 @@ def test_description_update(dcur: snowflake.connector.cursor.DictCursor):
 
 
 def test_describe_table_three_part_no_use(_fakesnow_no_auto_create: None):
-    """B4: DESCRIBE TABLE db.schema.t must work when the session has no current database.
+    """DESCRIBE catalog-prefix: DESCRIBE TABLE db.schema.t must work when the session has no current database.
 
-    Regression for fakesnow gap #3 residual: SQL_DESCRIBE_TABLE template referenced
+    Regression: SQL_DESCRIBE_TABLE template referenced
     `_fs_information_schema._fs_columns` without a catalog prefix, so the redirect
     failed when the session never USE'd a database (or USE'd a different one).
     """
@@ -341,7 +341,7 @@ def test_describe_table_three_part_no_use(_fakesnow_no_auto_create: None):
 
 
 def test_describe_table_cross_database(_fakesnow_no_auto_create: None):
-    """B4: DESCRIBE TABLE db1.schema.t when the session has db2 as current must hit db1.
+    """DESCRIBE catalog-prefix: DESCRIBE TABLE db1.schema.t when the session has db2 as current must hit db1.
 
     Silent variant of the bug: previously returned zero rows because the redirect
     bound to db2's `_fs_information_schema._fs_columns` which lacked db1's metadata.

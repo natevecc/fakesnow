@@ -44,110 +44,13 @@ class SafeJSONResponse(JSONResponse):
 logger.info(f"Creating shared in-memory database for session")
 shared_fs = FakeSnow()
 sessions: dict[str, FakeSnowflakeConnection] = {}
-# B10: persistent-mode FakeSnow instances cached by resolved `db_path`. Every
-# `FakeSnow(db_path=...)` opens a private DuckDB connection and ATTACHes each
-# `*.db` file in the directory. DuckDB enforces process-wide unique file
-# handles, so a second login against the same path used to crash with
-# `BinderException: Unique file handle conflict`. Caching by db_path makes
-# repeat logins reuse the existing instance (and its already-attached files).
-# Reverse-mapped per-token entries let `session(delete=true)` decrement a
-# refcount so cache entries can be torn down when the last session closes.
-#
-# No automatic eviction: entries persist until refcount hits zero via
-# `session(delete=true)`. Clients that drop without sending the close request
-# (network failure, process kill, dbt aborting mid-run) leak entries for the
-# server lifetime -- see `_release_persistent_instance` docstring.
-_fakesnow_instances_by_db_path: dict[str, FakeSnow] = {}
-_fakesnow_refcounts_by_db_path: dict[str, int] = {}
-_db_path_by_token: dict[str, str] = {}
-
-
-def _acquire_persistent_instance(db_path: str, token: str) -> FakeSnow:
-    """Return the cached FakeSnow for `db_path` (creating it on first use) and
-    refcount-bind it to `token` in one atomic-ish step.
-
-    Caching is keyed on the raw `db_path` string the client supplied. Two
-    clients that pass equivalent-but-not-identical strings (e.g. `"/tmp/x"`
-    vs `"/tmp/x/"`) get separate instances, which is fine in practice -- the
-    bug we are fixing is the common case where dbt or another tool opens
-    several sequential connections with an identical path string. Normalising
-    paths here would be incorrect because `FakeSnow` itself is keyed on the
-    raw `db_path` it stores; collisions across different normalised forms
-    would still hit DuckDB's unique-file-handle check.
-
-    Acquire+refcount-increment happen here (rather than splitting them between
-    this helper and `login_request`) so a failure between cache insert and
-    refcount bump cannot leave a stranded entry with refcount=0. Callers that
-    fail downstream (e.g. `fs.connect()` raises) MUST call
-    `_release_persistent_instance(token)` to undo the acquire.
-
-    Concurrency invariant: this helper contains no `await`s, so within a single
-    coroutine call the dict mutations are effectively atomic under the GIL.
-    `FakeSnow(db_path=...)` does block on disk I/O which releases the GIL, but
-    uvicorn's default single-event-loop model means no other request handler
-    runs in that window. Do NOT introduce `await` here without adding an
-    `asyncio.Lock` -- two concurrent logins for the same path could otherwise
-    each see `fs is None` and both call `FakeSnow(db_path=...)`.
-    """
-    fs = _fakesnow_instances_by_db_path.get(db_path)
-    if fs is None:
-        logger.info(f"Creating new persistent FakeSnow instance for db_path={db_path}")
-        fs = FakeSnow(db_path=db_path)
-        _fakesnow_instances_by_db_path[db_path] = fs
-        _fakesnow_refcounts_by_db_path[db_path] = 1
-    else:
-        logger.info(f"Reusing cached persistent FakeSnow instance for db_path={db_path}")
-        _fakesnow_refcounts_by_db_path[db_path] += 1
-    _db_path_by_token[token] = db_path
-    return fs
-
-
-def _release_persistent_instance(token: str) -> None:
-    """Decrement the refcount for the FakeSnow associated with `token`.
-
-    When the count hits zero we drop the cached instance and close its DuckDB
-    handle so subsequent logins to the same path see a fresh state. Tokens
-    that never used a persistent path (in-memory / isolated) are no-ops.
-
-    Leak surface: if a client never sends `session(delete=true)` (network drop,
-    process kill, dbt with `reuse_connections: false` aborting mid-run), the
-    cache entry stays pinned for the server lifetime with file handles open.
-    Operators of long-lived fakesnow servers should plan to bounce the process
-    periodically. A future patch could add a TTL reaper or a weakref hook on
-    `FakeSnowflakeConnection` finalisation.
-    """
-    db_path = _db_path_by_token.pop(token, None)
-    if db_path is None:
-        return
-    remaining = _fakesnow_refcounts_by_db_path.get(db_path, 0) - 1
-    if remaining < 0:
-        logger.warning(
-            f"Refcount for db_path={db_path} went negative; double-release suspected"
-        )
-        remaining = 0
-    if remaining == 0:
-        logger.info(
-            f"Last session for db_path={db_path} closed; dropping cached FakeSnow"
-        )
-        fs = _fakesnow_instances_by_db_path.pop(db_path, None)
-        _fakesnow_refcounts_by_db_path.pop(db_path, None)
-        if fs is not None:
-            try:
-                fs.duck_conn.close()
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    f"Error while closing FakeSnow for db_path={db_path}",
-                    exc_info=True,
-                )
-    else:
-        _fakesnow_refcounts_by_db_path[db_path] = remaining
-# B5: per-session SDK-driver toggles captured at login. The Node SDK selects
-# `convertRawBigInt` only when `JS_TREAT_INTEGER_AS_BIGINT` is present in the
-# per-query `data.parameters` array. The flag is supplied by the client at
-# login under SESSION_PARAMETERS but real Snowflake echoes it back on every
-# query response. We mirror that here without modifying FakeSnowflakeConnection.
-# Keys are the same login tokens used in `sessions`; entries are removed by
-# `session(delete=true)`.
+# Per-session SDK-driver toggles captured at login for Node SDK BigInt
+# normalization. The Node SDK selects `convertRawBigInt` only when
+# `JS_TREAT_INTEGER_AS_BIGINT` is present in the per-query `data.parameters`
+# array. The flag is supplied by the client at login under SESSION_PARAMETERS
+# but real Snowflake echoes it back on every query response. We mirror that
+# here without modifying FakeSnowflakeConnection. Keys are the same login
+# tokens used in `sessions`; entries are removed by `session(delete=true)`.
 _session_params_by_token: dict[str, dict[str, Any]] = {}
 
 
@@ -167,9 +70,10 @@ def _build_query_parameters(token: str | None) -> list[dict[str, Any]]:
     preserves the client's value type, and a forced `bool(...)` on a string
     like "false" would invert the intent (any non-empty string is truthy).
 
-    Parameters the client did not supply are simply not echoed -- pre-B5
-    fakesnow only echoed TIMEZONE, so this preserves backward compatibility
-    for clients that never opted into JS_TREAT_INTEGER_AS_BIGINT.
+    Parameters the client did not supply are simply not echoed -- before
+    BigInt normalization was added, fakesnow only echoed TIMEZONE, so this
+    preserves backward compatibility for clients that never opted into
+    JS_TREAT_INTEGER_AS_BIGINT.
     """
     params: list[dict[str, Any]] = [{"name": "TIMEZONE", "value": "Etc/UTC"}]
     sp = _session_params_by_token.get(token, {}) if token else {}
@@ -193,7 +97,7 @@ def _stringify_fixed_ints(
 
     Narrow predicate (`scale == 0` only) by design: matches the bug, leaves
     DECIMAL(N,M) untouched, minimizes blast radius for Python-SDK JSON-path
-    consumers. See B5 design doc open question #1.
+    consumers.
     """
     fixed_int_cols = [
         i
@@ -244,17 +148,10 @@ async def login_request(request: Request) -> JSONResponse:
         fs = FakeSnow()
     else:
         # Use the set value for db_path. This instructs fakesnow to persist databases to the filesystem, making it
-        # persistent across server restarts. B10: cache by db_path so repeat
-        # logins share one DuckDB connection (and its attached files); see
-        # `_acquire_persistent_instance` for rationale. Token is generated up
-        # front so acquire and refcount-bind happen atomically.
+        # persistent across server restarts.
         logger.info(f"Using persistent database at {db_path} for session")
+        fs = FakeSnow(db_path=db_path)
     token = secrets.token_urlsafe(32)
-    if db_path is not None and db_path != ":isolated:":
-        # B10: in-memory (`shared_fs`) and `:isolated:` tokens deliberately
-        # bypass the cache -- in-memory is already a single shared instance,
-        # and `:isolated:` must produce a fresh `FakeSnow` per login by design.
-        fs = _acquire_persistent_instance(db_path, token)
     # Forward the full session_params dict so connection-level fakesnow-specific
     # toggles (e.g. FAKESNOW_PRESERVE_IDENTIFIER_CASE) reach FakeSnowflakeConnection
     # without requiring a server.py edit per new opt-in. AUTOCOMMIT and nop_regexes
@@ -267,24 +164,17 @@ async def login_request(request: Request) -> JSONResponse:
         f"[LOGIN] database={database} schema={schema} autocommit={autocommit} "
         f"nop_regexes={nop_regexes} preserve_identifier_case={preserve_id_case}"
     )
-    try:
-        sessions[token] = fs.connect(
-            database,
-            schema,
-            nop_regexes=nop_regexes,
-            autocommit=autocommit,
-            session_parameters=session_params,
-        )
-    except Exception:
-        # B10: if `fs.connect` raises after we acquired the persistent cache
-        # entry, release the refcount so a stranded entry with refcount=0
-        # doesn't pin the FakeSnow + DuckDB handle for the process lifetime.
-        # No-op for in-memory / `:isolated:` tokens (never bound).
-        _release_persistent_instance(token)
-        raise
-    # B5: stash the raw SESSION_PARAMETERS dict so per-query responses can
-    # echo SDK-driver toggles like JS_TREAT_INTEGER_AS_BIGINT. See
-    # `_build_query_parameters` and design doc 2026-04-26-b5-design.md.
+    sessions[token] = fs.connect(
+        database,
+        schema,
+        nop_regexes=nop_regexes,
+        autocommit=autocommit,
+        session_parameters=session_params,
+    )
+    # Stash the raw SESSION_PARAMETERS dict so per-query responses can echo
+    # SDK-driver toggles like JS_TREAT_INTEGER_AS_BIGINT back to the client
+    # (real Snowflake echoes these on every query). See
+    # `_build_query_parameters` for which keys are forwarded.
     _session_params_by_token[token] = session_params
     response = {
         "data": {
@@ -375,7 +265,7 @@ async def query_request(request: Request) -> JSONResponse:
             # Convert arrow table to array of arrays for Node.js SDK
             # SDK expects [[val1, val2], [val1, val2], ...], not [{col: val}, ...]
             rowset_json = [list(row.values()) for row in cur._arrow_table.to_pylist()]  # noqa: SLF001
-            # B5: stringify scale-0 fixed numerics so the Node SDK can call
+            # Stringify scale-0 fixed numerics so the Node SDK can call
             # bigInt(rawColumnValue) without losing precision past 2^53.
             rowset_json = _stringify_fixed_ints(rowset_json, rowtype)
             logger.debug(f"[QUERY_REQUEST] Arrow table: {len(rowset_json)} rows, rowset_b64 length={len(rowset_b64)}")
@@ -464,7 +354,8 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
             batch_bytes = to_ipc(to_sf(arrow_table, rowtype))
             rowset_b64 = b64encode(batch_bytes).decode("utf-8")
             rowset_json = [list(row.values()) for row in arrow_table.to_pylist()]
-            # B5: stringify scale-0 fixed numerics for Node SDK BigInt path.
+            # Stringify scale-0 fixed numerics for the Node SDK BigInt path
+            # (mirrors the fresh-query path in `query_request`).
             rowset_json = _stringify_fixed_ints(rowset_json, rowtype)
         else:
             rowtype = []
@@ -538,19 +429,11 @@ async def session(request: Request) -> JSONResponse:
             try:
                 sessions[token]._duck_conn.close()  # Close the duckdb connection to release resources
             finally:
-                # Always release per-token state, even if the duckdb handle
-                # close raises -- otherwise the refcount leaks and pins the
-                # cached FakeSnow for the process lifetime.
                 sessions.pop(token, None)
-                # B5: drop the session-params shadow entry so we don't leak
-                # per-token state across the server lifetime.
+                # Drop the session-params shadow entry (used to echo SDK
+                # toggles like JS_TREAT_INTEGER_AS_BIGINT on every query) so
+                # we don't leak per-token state across the server lifetime.
                 _session_params_by_token.pop(token, None)
-                # B10: refcount-release the persistent FakeSnow entry (no-op
-                # for in-memory / :isolated: tokens). When the last session for
-                # a path closes, the cached instance and its DuckDB handle are
-                # dropped so the next login re-attaches the on-disk files
-                # cleanly.
-                _release_persistent_instance(token)
         else:
             logger.debug(f"[SESSION] HEARTBEAT")
 

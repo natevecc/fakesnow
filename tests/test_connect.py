@@ -131,27 +131,6 @@ def test_connect_current_version(cur: snowflake.connector.cursor.SnowflakeCursor
     assert tuple(int(part) for part in version[0].split(".")) == (0, 0, 0)
 
 
-def test_connect_current_warehouse(cur: snowflake.connector.cursor.SnowflakeCursor):
-    # Snowflake's CURRENT_WAREHOUSE() scalar must resolve so dbt-snowflake's
-    # `dynamic_table` materialization probe succeeds. fakesnow registers the
-    # macro per-attached-catalog at connect time; an unqualified call in any
-    # session that has set a database must return a non-empty string.
-    # See docs/decisions/2026-04-26-fakesnow-fifth-fix.md (b7-current-warehouse).
-    warehouse = cur.execute("SELECT CURRENT_WAREHOUSE()").fetchone()
-
-    assert warehouse is not None
-    assert isinstance(warehouse[0], str)
-    assert warehouse[0]  # non-empty
-    # Snowflake convention: warehouse names are uppercase. Pin this so a
-    # regression that lowercased the constant would be caught.
-    assert warehouse[0] == warehouse[0].upper()
-
-    # Mirror dbt-snowflake's pre-DDL probe shape.
-    aliased = cur.execute("SELECT current_warehouse() AS warehouse").fetchone()
-    assert aliased is not None
-    assert aliased[0] == warehouse[0]
-
-
 def test_connect_then_unset_schema(_fakesnow: None):
     with snowflake.connector.connect(database="db1", schema="schema1") as conn, conn.cursor() as cur:
         # this will unset the schema

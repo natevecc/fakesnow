@@ -156,52 +156,6 @@ def create_clone(expression: Expr) -> Expr:
     return expression
 
 
-def create_temp_view_strip_qualifier(expression: Expr) -> Expr:
-    """Strip db/schema qualifier from CREATE [OR REPLACE] TEMP[ORARY] VIEW statements.
-
-    Snowflake accepts a fully-qualified name (``db.schema.x``) on a temporary view but the
-    object is still session-local — the qualifier is effectively ignored. DuckDB rejects it
-    outright with ``Parser Error: TEMPORARY table names can *only* use the "temp" catalog``,
-    which fires on every incremental dbt rebuild after the first run because dbt emits
-    ``CREATE OR REPLACE TEMPORARY VIEW <db>.<schema>.<model>__dbt_tmp ...``.
-
-    We rewrite the CREATE so DuckDB places the view in its session-local ``temp`` catalog;
-    dbt's follow-up ``SELECT ... FROM <model>__dbt_tmp`` resolves there because DuckDB
-    searches the temp catalog ahead of attached databases.
-
-    Limitation: a downstream ``SELECT ... FROM <db>.<schema>.<model>__dbt_tmp`` that re-uses
-    the original 3-part qualifier will resolve on Snowflake but raise ``CatalogException``
-    on DuckDB (the temp catalog cannot be addressed via an attached-database name). dbt does
-    not emit this pattern; if a caller does, it must reference the temp view unqualified
-    or via ``temp.main.<x>``.
-
-    Example:
-        >>> import sqlglot
-        >>> sqlglot.parse_one(
-        ...     "CREATE OR REPLACE TEMPORARY VIEW mydb.gold.x__dbt_tmp AS SELECT 1",
-        ...     read="snowflake",
-        ... ).transform(create_temp_view_strip_qualifier).sql()
-        'CREATE OR REPLACE TEMPORARY VIEW x__dbt_tmp AS SELECT 1'
-    """
-
-    if (
-        isinstance(expression, exp.Create)
-        and str(expression.args.get("kind")).upper() == "VIEW"
-        and (props := expression.args.get("properties"))
-        and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
-        and isinstance(expression.this, exp.Table)
-        and (expression.this.args.get("db") or expression.this.args.get("catalog"))
-    ):
-        new = expression.copy()
-        table = new.this
-        assert isinstance(table, exp.Table)
-        table.set("db", None)
-        table.set("catalog", None)
-        return new
-
-    return expression
-
-
 def current_version(expression: Expr) -> Expr:
     """Return a Snowflake-compatible server version string instead of the DuckDB version.
 
@@ -984,8 +938,8 @@ def _normalize_regex_pattern(pattern: str) -> str:
     * `[]]` (literal `]` as first char of class) and other RE2-grammar edge cases: the
       simple `[`/`]` toggle does not implement the full RE2 grammar.
     * Snowflake-only escapes `\xhh`, `\Uhhhhhhhh`, `\Z` are stripped to literals because
-      DuckDB rejects them in their bare form. If Cerner or other production patterns ever
-      rely on these, a separate transform converting them to DuckDB's accepted syntax
+      DuckDB rejects them in their bare form. If production patterns ever rely on these,
+      a separate transform converting them to DuckDB's accepted syntax
       (e.g. `\xff` -> `\x{ff}`) would be needed.
     """
     if "\\" not in pattern:

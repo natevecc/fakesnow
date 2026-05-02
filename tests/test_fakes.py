@@ -188,36 +188,6 @@ def test_create_table_as(dcur: snowflake.connector.cursor.SnowflakeCursor) -> No
     assert dcur.fetchall() == [{"ID": "1"}]
 
 
-def test_create_temp_view_three_part_name(dcur: snowflake.connector.cursor.SnowflakeCursor):
-    """dbt's incremental rebuild emits ``CREATE OR REPLACE TEMPORARY VIEW <db>.<schema>.<x>__dbt_tmp``.
-    Snowflake accepts the qualifier (the view is still session-local), but DuckDB rejects it.
-    fakesnow strips the qualifier so DuckDB places the view in its session-local ``temp`` catalog,
-    and the follow-up ``SELECT * FROM <x>__dbt_tmp`` resolves there.
-    """
-
-    dcur.execute(
-        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 1 AS col"
-    )
-    dcur.execute("SELECT * FROM test_view__dbt_tmp")
-    assert dcur.fetchall() == [{"COL": 1}]
-
-    # Re-issuing the same CREATE OR REPLACE (the dbt rebuild after first run) must succeed too.
-    dcur.execute(
-        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 2 AS col"
-    )
-    dcur.execute("SELECT * FROM test_view__dbt_tmp")
-    assert dcur.fetchall() == [{"COL": 2}]
-
-    # After USE <db>.<schema>, the unqualified follow-up SELECT must still resolve via DuckDB's
-    # temp catalog (which is searched ahead of attached databases).
-    dcur.execute("USE SCHEMA db1.schema1")
-    dcur.execute(
-        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 3 AS col"
-    )
-    dcur.execute("SELECT * FROM test_view__dbt_tmp")
-    assert dcur.fetchall() == [{"COL": 3}]
-
-
 def test_dateadd_date_cast(dcur: snowflake.connector.DictCursor):
     q = """
     SELECT
@@ -462,7 +432,7 @@ def test_preserve_identifier_case_opt_in_lowercase(_fakesnow: None) -> None:
 
 def test_preserve_identifier_case_opt_in_lowercase_dict_cursor(_fakesnow: None) -> None:
     """With the opt-in, dict-cursor row keys are also lower-cased to match the
-    description. This is the path the Phrase replay code reads."""
+    description. This is the path downstream dict-cursor consumers rely on."""
     with snowflake.connector.connect(
         session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
     ) as conn, conn.cursor(snowflake.connector.cursor.DictCursor) as dcur:
@@ -666,7 +636,7 @@ def test_regex_substr_non_literal_occurrence(cur: snowflake.connector.cursor.Sno
 def test_regex_unknown_escape_treated_literal(cur: snowflake.connector.cursor.SnowflakeCursor):
     # Snowflake silently treats `\<unknown>` as the literal char; DuckDB's RE2 raises
     # `invalid escape sequence: \M`. fakesnow must pre-escape unknown `\X` to `\\X`
-    # so DuckDB sees a literal X. Cerner's EKS-blob parser uses `\M`, `\O`, etc.
+    # so DuckDB sees a literal X. Some upstream blob parsers use `\M`, `\O`, etc.
     # as field markers in patterns like `'\\M([^\\]+)\\C\\d+\\O\\d+'`.
 
     # single unknown letter — \M should match literal M
@@ -693,7 +663,7 @@ def test_regex_unknown_escape_treated_literal(cur: snowflake.connector.cursor.Sn
     cur.execute(r"select regexp_replace('a1b2c3', '\\d', '#')")
     assert cur.fetchone() == ("a#b#c#",)
 
-    # the cerner-blob field-marker pattern shape (mnemonic / orderable_id) — both \M and \O
+    # blob field-marker pattern shape (mnemonic / orderable_id) — both \M and \O
     # unknown to duckdb. Group 1 captures everything between the M and O markers.
     cur.execute(r"select regexp_substr('Mfoo bar O123', '\\M([^O]+)\\O(\\d+)', 1, 1, 'e', 1)")
     assert cur.fetchone() == ("foo bar ",)
@@ -812,15 +782,14 @@ def test_to_date(cur: snowflake.connector.cursor.SnowflakeCursor):
 
 
 def test_qmark_cast_on_bind_param(cur: snowflake.connector.cursor.SnowflakeCursor):
-    """Bind-parameter cast syntax (e.g. ?::TIMESTAMP) should be rewritten to CAST(? AS TIMESTAMP)
-    before being parsed.
+    """Bind-parameter cast syntax (e.g. ?::TIMESTAMP) should round-trip through fakesnow.
 
-    sqlglot's snowflake/duckdb parser does not accept ``?::TYPE`` (only literal/identifier
-    forms like ``$1::TYPE`` parse). Drivers (notably the Node snowflake-sdk and Slonik via the
-    PR-313 wire server) routinely emit ``?::TIMESTAMP`` after their own placeholder substitution.
-    All assertions exercise the server path (``binding_params`` kwarg) since that is the path
-    where ``?::TYPE`` originates in production; the rewrite runs before the param branch so it
-    also covers any local qmark-paramstyle clients that emit the same form.
+    Drivers that bind by position (notably the Node snowflake-sdk and Slonik via the
+    PR-313 wire server) routinely emit ``?::TIMESTAMP`` after their own placeholder
+    substitution. Our pinned sqlglot fork parses ``?::TYPE`` natively (via the QDCOLON
+    parser) into ``Cast(this=Placeholder(), to=TYPE)``, so no SQL pre-pass is needed.
+    All assertions exercise the server path (``binding_params`` kwarg) since that is
+    the shape that originates in production.
     """
     # ?::TIMESTAMP round-trip
     cur.execute("CREATE OR REPLACE TABLE ts_bind (ts TIMESTAMP)")
