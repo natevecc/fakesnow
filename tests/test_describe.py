@@ -315,3 +315,50 @@ def test_description_update(dcur: snowflake.connector.cursor.DictCursor):
         ResultMetadata(name='number of multi-joined rows updated', type_code=0, display_size=None, internal_size=None, precision=38, scale=0, is_nullable=True)
     ]
     # fmt: on
+
+
+def test_describe_table_three_part_no_use(_fakesnow_no_auto_create: None):
+    """B4: DESCRIBE TABLE db.schema.t must work when the session has no current database.
+
+    Regression for fakesnow gap #3 residual: SQL_DESCRIBE_TABLE template referenced
+    `_fs_information_schema._fs_columns` without a catalog prefix, so the redirect
+    failed when the session never USE'd a database (or USE'd a different one).
+    """
+    with snowflake.connector.connect() as conn, conn.cursor(snowflake.connector.cursor.DictCursor) as cur:
+        cur.execute("CREATE DATABASE IF NOT EXISTS DB1")
+        cur.execute("CREATE SCHEMA IF NOT EXISTS DB1.S1")
+        cur.execute("CREATE TABLE IF NOT EXISTS DB1.S1.T1 (id INT, name VARCHAR(20))")
+
+        # No USE preamble. Three-part name must resolve.
+        rows = cur.execute("DESCRIBE TABLE DB1.S1.T1").fetchall()
+        assert [r["name"] for r in rows] == ["ID", "NAME"]
+        assert rows[0]["type"] == "NUMBER(38,0)"
+        assert rows[1]["type"] == "VARCHAR(20)"
+
+        # Quoted-identifier variant.
+        rows = cur.execute('DESCRIBE TABLE "DB1"."S1"."T1"').fetchall()
+        assert [r["name"] for r in rows] == ["ID", "NAME"]
+
+
+def test_describe_table_cross_database(_fakesnow_no_auto_create: None):
+    """B4: DESCRIBE TABLE db1.schema.t when the session has db2 as current must hit db1.
+
+    Silent variant of the bug: previously returned zero rows because the redirect
+    bound to db2's `_fs_information_schema._fs_columns` which lacked db1's metadata.
+    """
+    with snowflake.connector.connect() as conn, conn.cursor(snowflake.connector.cursor.DictCursor) as cur:
+        cur.execute("CREATE DATABASE IF NOT EXISTS DB1")
+        cur.execute("CREATE SCHEMA IF NOT EXISTS DB1.S1")
+        cur.execute("CREATE TABLE IF NOT EXISTS DB1.S1.T1 (id INT, name VARCHAR(20))")
+
+        cur.execute("CREATE DATABASE IF NOT EXISTS DB2")
+        cur.execute("CREATE SCHEMA IF NOT EXISTS DB2.S2")
+        cur.execute("CREATE TABLE IF NOT EXISTS DB2.S2.T2 (other_col TIMESTAMP)")
+
+        # Switch session into DB2 / S2; describing DB1.S1.T1 must still hit DB1's columns.
+        cur.execute("USE DATABASE DB2")
+        cur.execute("USE SCHEMA S2")
+
+        rows = cur.execute("DESCRIBE TABLE DB1.S1.T1").fetchall()
+        assert [r["name"] for r in rows] == ["ID", "NAME"]
+        assert rows[1]["type"] == "VARCHAR(20)"

@@ -292,6 +292,34 @@ For more detail see the [test suite](tests/).
 - Row ordering is non-deterministic and may differ from Snowflake unless you fully specify the ORDER BY clause.
 - fakesnow supports a more liberal SQL dialect than actual Snowflake. This means some queries that work with fakesnow might not work with a real Snowflake instance.
 
+## Identifier casing
+
+By default fakesnow upper-cases unquoted identifiers in result column metadata to mimic Snowflake's behavior:
+
+```python
+cur.execute("SELECT 1 AS my_col")
+[d.name for d in cur.description]  # ['MY_COL']
+```
+
+If you author SQL with intentionally lower-cased aliases and want them returned verbatim, set the `FAKESNOW_PRESERVE_IDENTIFIER_CASE` opt-in:
+
+```python
+with snowflake.connector.connect(
+    session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+) as conn, conn.cursor() as cur:
+    cur.execute("SELECT 1 AS my_col")
+    [d.name for d in cur.description]  # ['my_col']
+```
+
+The same opt-in is also accessible via the `preserve_identifier_case=True` kwarg on `FakeSnow.connect(...)`.
+
+Notes:
+
+- This is a fakesnow-specific opt-in, not equivalent to Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` (which only affects quoted-identifier catalog lookup, not result casing).
+- The flag is read once at connect time. `ALTER SESSION SET FAKESNOW_PRESERVE_IDENTIFIER_CASE` is rejected.
+- Quoted identifiers are always preserved as-typed regardless of the flag.
+- `SELECT *` returns the column names as stored in the table; the flag does not retroactively change tables that were created without it.
+
 ## COPY INTO
 
 `COPY INTO` can be used from S3 sources and stages. By default the standard AWS credential chain will be used. If you are getting an HTTP 403 or need to provide alternative S3 credentials you can use the duckdb [CREATE SECRET](https://duckdb.org/docs/stable/extensions/httpfs/s3api) statement. For an example of creating a secret to use a moto S3 endpoint see `s3_client` in [conftest.py](tests/conftest.py#L80)

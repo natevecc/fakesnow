@@ -34,6 +34,7 @@ from fakesnow.transforms.transforms import (
     create_clone as create_clone,
     create_database as create_database,
     create_table_as as create_table_as,
+    create_temp_view_strip_qualifier as create_temp_view_strip_qualifier,
     create_user as create_user,
     current_version as current_version,
     dateadd_date_cast as dateadd_date_cast,

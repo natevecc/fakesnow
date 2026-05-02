@@ -77,6 +77,7 @@ class FakeSnow:
         database: str | None = None,
         schema: str | None = None,
         nop_regexes: list[str] | None = None,
+        preserve_identifier_case: bool | None = None,
         **kwargs: Any,
     ) -> fakes.FakeSnowflakeConnection:
         # every time we connect, create a new cursor (ie: connection) so we can isolate each connection's
@@ -84,6 +85,9 @@ class FakeSnow:
         # https://github.com/duckdb/duckdb/blob/18254ec/tools/pythonpkg/src/pyconnection.cpp#L1440
         # and to make connections thread-safe see
         # https://duckdb.org/docs/api/python/overview.html#using-connections-in-parallel-python-programs
+        if preserve_identifier_case is not None:
+            # forward as kwarg so FakeSnowflakeConnection's "kwarg wins" precedence applies
+            kwargs["preserve_identifier_case"] = preserve_identifier_case
         return fakes.FakeSnowflakeConnection(
             self.duck_conn.cursor(),
             self.results_cache,

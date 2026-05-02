@@ -20,6 +20,22 @@ from fakesnow.cursor import FakeSnowflakeCursor
 from fakesnow.variables import Variables
 
 
+def _coerce_bool(value: Any) -> bool:
+    """Coerce a session-parameter value to bool with friendly handling for strings.
+
+    True booleans, integers, and the strings "true"/"1"/"yes"/"on" (case-insensitive)
+    enable the flag. The string "false"/"0"/"no"/"off" (case-insensitive), None, and
+    empty values disable it. Any other truthy value coerces via bool().
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 class FakeSnowflakeConnection:
     def __init__(
         self,
@@ -56,6 +72,26 @@ class FakeSnowflakeConnection:
         self.results_cache = results_cache
         self._autocommit = kwargs.get("autocommit", True)
         self._in_transaction = False
+        # Opt-in fakesnow-specific knob: when True, skip the upper-casing of unquoted
+        # identifiers so result columns retain DuckDB's natural lower casing. Default
+        # False preserves Snowflake-mimicking behavior. Not equivalent to Snowflake's
+        # QUOTED_IDENTIFIERS_IGNORE_CASE (which only affects quoted-identifier catalog
+        # lookup, not result casing) and not equivalent to DuckDB's own setting of the
+        # same name (DuckDB's controls display, but fakesnow rewrites SQL before DuckDB
+        # sees it -- the rewrite is what we skip). The value is read once here and
+        # stored in self.preserve_identifier_case; mutating session_parameters or the
+        # source dict after construction has no effect. The kwarg wins when explicitly
+        # provided (even when False), otherwise the session_parameter value is used.
+        # See ADR docs/decisions/2026-04-26-fakesnow-first-fix.md.
+        # TODO(phrase-fork): remove if/when fakesnow upstream lands a built-in opt-in.
+        session_parameters = kwargs.get("session_parameters") or {}
+        kwarg_value = kwargs.get("preserve_identifier_case")
+        if kwarg_value is not None:
+            self.preserve_identifier_case: bool = _coerce_bool(kwarg_value)
+        else:
+            self.preserve_identifier_case = _coerce_bool(
+                session_parameters.get("FAKESNOW_PRESERVE_IDENTIFIER_CASE")
+            )
 
         # create database if needed
         if (

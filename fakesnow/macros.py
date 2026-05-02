@@ -68,10 +68,48 @@ CREATE OR REPLACE MACRO ${catalog}._fs_to_timestamp(val, scale) AS (
 """
 )
 
+# Snowflake's CURRENT_WAREHOUSE() scalar — DuckDB has no native equivalent and
+# fakesnow does not (yet) track the per-session warehouse on the connection. We
+# register an unqualified macro per-attached-catalog so an unqualified call
+# resolves while the session has any of fakesnow's databases on its search path
+# (the same per-catalog registration approach the _fs_* macros use). Returns a
+# constant 'COMPUTE_WH' to satisfy dbt-snowflake's pre-DDL probe for
+# `dynamic_table` materializations (16 cerner_transforms models depend on
+# this). See docs/decisions/2026-04-26-fakesnow-fifth-fix.md
+# (b7-current-warehouse).
+#
+# NOTE on naming divergence: unlike `_fs_*` macros which are internal
+# implementation helpers invoked by sqlglot transforms in
+# transforms/transforms.py, this macro takes its user-facing Snowflake name
+# (`current_warehouse`) directly so unmodified Snowflake SQL resolves without
+# a transform pass. Future refactors that grep `_fs_*` to enumerate
+# fakesnow's DuckDB shims should be aware of this deliberate exception.
+#
+# Known limitations (deferred to a follow-up that may touch conn.py):
+#   - Returns the constant 'COMPUTE_WH' regardless of what was passed to
+#     `snowflake.connector.connect(warehouse=...)`. Code that branches on
+#     warehouse identity will see 'COMPUTE_WH' for every session.
+#   - Resolves only when the session schema is set to a fakesnow-attached
+#     catalog. `connect()` with no database leaves the session in DuckDB's
+#     default `memory` catalog, where this macro is not registered, so
+#     `current_warehouse()` raises the original Catalog Error in that path.
+#     Real Snowflake returns the warehouse (or NULL) regardless of database.
+# TODO(phrase-fork): on upgrade, accept `warehouse` kwarg in conn.py, store
+# `self.warehouse = (kwarg or 'COMPUTE_WH').upper()`, set a duckdb session
+# variable via parameterised `execute("SET VARIABLE fakesnow_warehouse = ?", [...])`,
+# and rewrite the macro body to
+# `COALESCE(GETVARIABLE('fakesnow_warehouse'), 'COMPUTE_WH')`.
+FS_CURRENT_WAREHOUSE = Template(
+    """
+CREATE OR REPLACE MACRO ${catalog}.current_warehouse() AS 'COMPUTE_WH';
+"""
+)
+
 
 def creation_sql(catalog: str) -> str:
     return f"""
         {FS_FLATTEN.substitute(catalog=catalog)};
         {FS_OBJECT_CONSTRUCT.substitute(catalog=catalog)};
         {FS_TO_TIMESTAMP.substitute(catalog=catalog)};
+        {FS_CURRENT_WAREHOUSE.substitute(catalog=catalog)};
     """

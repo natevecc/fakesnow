@@ -234,6 +234,33 @@ def test_server_nop_regexes(server: dict) -> None:
         assert cur.fetchall() == [("Statement executed successfully.",)]
 
 
+def test_server_preserve_identifier_case_default(server: dict) -> None:
+    """Default behavior over the HTTP server path: unquoted identifiers in cursor
+    description are upper-cased, mimicking real Snowflake."""
+    server_default = {**server, "session_parameters": {**server["session_parameters"]}}
+    with snowflake.connector.connect(**server_default, database="db1", schema="schema1") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
+        assert [d.name for d in cur.description] == ["MY_COL", "ANOTHER_COL"]
+
+
+def test_server_preserve_identifier_case_opt_in(server: dict) -> None:
+    """The FAKESNOW_PRESERVE_IDENTIFIER_CASE session parameter survives the HTTP
+    login round-trip and reaches FakeSnowflakeConnection so cursor description
+    returns lower-cased names. This is the production code path for Phrase."""
+    server_with_flag = {
+        **server,
+        "session_parameters": {
+            **server["session_parameters"],
+            "FAKESNOW_PRESERVE_IDENTIFIER_CASE": True,
+        },
+    }
+    with snowflake.connector.connect(**server_with_flag, database="db1", schema="schema1") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
+        assert [d.name for d in cur.description] == ["my_col", "another_col"]
+
+
 def test_server_put_list(sdcur: snowflake.connector.cursor.DictCursor) -> None:
     dcur = sdcur
 
@@ -571,11 +598,13 @@ def test_server_get_cached_query_result(server: dict) -> None:
         assert "total" in data
         assert "returned" in data
 
-        # Verify data matches original query results
+        # Verify data matches original query results.
+        # B5: scale-0 fixed numerics are emitted as JSON strings in `rowset`
+        # so the Node SDK can parse them via bigInt() without precision loss.
         assert data["total"] == 1
         assert data["returned"] == 1
         assert len(data["rowset"]) == 1
-        assert data["rowset"][0] == [123, "test data"]
+        assert data["rowset"][0] == ["123", "test data"]
 
 
 def test_server_cache_eviction(sconn: snowflake.connector.SnowflakeConnection) -> None:
@@ -684,3 +713,469 @@ def test_server_get_cached_query_result_errors(server: dict) -> None:
         if response.status_code == 200:
             json_response = response.json()
             assert json_response["success"] is False
+
+
+# --- B5: Node SDK BigInt parity (JS_TREAT_INTEGER_AS_BIGINT) -----------------
+#
+# Real Snowflake's wire contract for the JSON `data.rowset` payload encodes
+# every fixed-point numeric value as a JSON STRING (not a bare JSON number),
+# so that the Node.js SDK can call `bigInt(rawColumnValue)` on a precision-
+# safe string representation. The Node SDK only takes the BigInt path when
+# (1) `JS_TREAT_INTEGER_AS_BIGINT` is echoed back in `data.parameters` and
+# (2) the column's `rowtype.scale` is 0. fakesnow used to violate both halves
+# of that contract — these tests pin the fix.
+
+
+def _login_and_get_token(server: dict, session_parameters: dict | None = None) -> str:
+    """Issue a raw login request so we can inspect the per-query JSON payload."""
+    payload = {
+        "data": {
+            "ACCOUNT_NAME": "fakesnow",
+            "LOGIN_NAME": "fake",
+            "PASSWORD": "snow",
+            "SESSION_PARAMETERS": session_parameters or {},
+            "CLIENT_APP_ID": "JavaScript",
+            "CLIENT_APP_VERSION": "1.0.0",
+            "CLIENT_ENVIRONMENT": {"APPLICATION": "test"},
+        }
+    }
+    resp = requests.post(
+        f"http://{server['host']}:{server['port']}/session/v1/login-request",
+        json=payload,
+        timeout=5,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"], body
+    return body["data"]["token"]
+
+
+def _exec_query(server: dict, token: str, sql: str) -> dict:
+    resp = requests.post(
+        f"http://{server['host']}:{server['port']}/queries/v1/query-request?requestId=b5",
+        headers={"Authorization": f'Snowflake Token="{token}"'},
+        json={"sqlText": sql},
+        timeout=5,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"], body
+    return body["data"]
+
+
+def test_server_b5_rowset_integer_emitted_as_string(server: dict) -> None:
+    """Snowflake wire contract: scale-0 numerics are JSON strings in `rowset`."""
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, "SELECT 42 AS answer")
+
+    rowtype = data["rowtype"]
+    assert rowtype[0]["type"] == "fixed"
+    assert rowtype[0]["scale"] == 0
+    # The column value MUST be a string, not a bare JSON number, so that
+    # node-side `bigInt(rawColumnValue)` receives a precision-safe input.
+    assert data["rowset"][0][0] == "42"
+
+
+def test_server_b5_rowset_large_integer_preserves_precision(server: dict) -> None:
+    """Integers > 2^53 must round-trip without precision loss.
+
+    If `rowset` ever encodes a Python int as a bare JSON number, the value is
+    silently lost during JSON.parse on the Node side (max safe int is 2^53-1).
+    Stringification is the only correct fix; we assert it directly here.
+    """
+    big = 2**62  # 4_611_686_018_427_387_904 — well past JS Number's safe range
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, f"SELECT {big} AS x")
+
+    assert data["rowtype"][0]["type"] == "fixed"
+    assert data["rowtype"][0]["scale"] == 0
+    assert data["rowset"][0][0] == str(big)
+    # Defensive: ensure we are NOT getting a Python-decoded int that JSON
+    # would have rounded. The string equality above already proves this for
+    # `requests.json()`, but a bare-number encoding would have produced a
+    # Python int equal to `big` — distinguishing requires the type check.
+    assert isinstance(data["rowset"][0][0], str)
+
+
+def test_server_b5_session_param_js_treat_integer_as_bigint_echoed(server: dict) -> None:
+    """`data.parameters` must echo `JS_TREAT_INTEGER_AS_BIGINT` when the
+    client supplied it at login. The Node SDK reads this from the per-query
+    `parameters` array (snowflake-sdk result.js:65-70) to decide between
+    `convertRawNumber` and `convertRawBigInt`."""
+    token = _login_and_get_token(
+        server,
+        session_parameters={"JS_TREAT_INTEGER_AS_BIGINT": True},
+    )
+    data = _exec_query(server, token, "SELECT 1")
+
+    params = {p["name"]: p["value"] for p in data["parameters"]}
+    assert params.get("JS_TREAT_INTEGER_AS_BIGINT") is True
+
+
+def test_server_b5_session_param_js_treat_integer_as_bigint_omitted_when_not_set(
+    server: dict,
+) -> None:
+    """If the client did not opt into JS_TREAT_INTEGER_AS_BIGINT at login, the
+    parameter must NOT appear in `data.parameters`. Pre-B5 fakesnow only
+    echoed TIMEZONE; this preserves backwards-compat for clients that never
+    sent the flag (loop1 fix to `_build_query_parameters`)."""
+    token = _login_and_get_token(server)  # no session_parameters
+    data = _exec_query(server, token, "SELECT 1")
+
+    names = {p["name"] for p in data["parameters"]}
+    assert "JS_TREAT_INTEGER_AS_BIGINT" not in names
+
+
+def test_server_b5_rowset_negative_integer_emitted_as_string(server: dict) -> None:
+    """Negative scale-0 fixed numerics must round-trip as the canonical
+    signed string form."""
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, "SELECT -42 AS n")
+    assert data["rowtype"][0]["type"] == "fixed"
+    assert data["rowtype"][0]["scale"] == 0
+    assert data["rowset"][0][0] == "-42"
+
+
+def test_server_b5_rowset_null_integer_remains_null(server: dict) -> None:
+    """NULL must NOT be stringified to 'None' -- the helper guards on
+    `row[i] is not None`. JSON null must round-trip as Python None."""
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, "SELECT CAST(NULL AS INTEGER) AS n")
+    assert data["rowtype"][0]["type"] == "fixed"
+    assert data["rowtype"][0]["scale"] == 0
+    assert data["rowset"][0][0] is None
+
+
+def test_server_b5_rowset_multiple_rows_all_stringified(server: dict) -> None:
+    """The inner row loop must visit every row, not just row 0."""
+    token = _login_and_get_token(server)
+    data = _exec_query(
+        server, token, "SELECT * FROM (VALUES (1), (2), (3)) AS t(n) ORDER BY n"
+    )
+    assert data["rowtype"][0]["type"] == "fixed"
+    assert data["rowtype"][0]["scale"] == 0
+    assert [row[0] for row in data["rowset"]] == ["1", "2", "3"]
+
+
+def test_server_b5_cached_result_echoes_bigint_param_and_stringifies(
+    server: dict,
+) -> None:
+    """Loop2 coverage: B5's wiring is symmetric across `query_request` AND
+    `get_cached_query_result`. This test executes a query (which caches the
+    result), then re-fetches via the cached-result endpoint and asserts BOTH
+    contracts: rowset stringification AND `JS_TREAT_INTEGER_AS_BIGINT` echo.
+    """
+    token = _login_and_get_token(
+        server, session_parameters={"JS_TREAT_INTEGER_AS_BIGINT": True}
+    )
+    # First query populates the cache.
+    first = _exec_query(server, token, "SELECT 12345 AS n")
+    query_id = first["queryId"]
+
+    # Second fetch hits the cached-result endpoint.
+    resp = requests.get(
+        f"http://{server['host']}:{server['port']}/queries/{query_id}/result",
+        headers={"Authorization": f'Snowflake Token="{token}"'},
+        timeout=5,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"], body
+    cached = body["data"]
+
+    # Stringification through the cached path.
+    assert cached["rowtype"][0]["type"] == "fixed"
+    assert cached["rowtype"][0]["scale"] == 0
+    assert cached["rowset"][0][0] == "12345"
+
+    # BigInt-flag echo through the cached path.
+    params = {p["name"]: p["value"] for p in cached["parameters"]}
+    assert params.get("JS_TREAT_INTEGER_AS_BIGINT") is True
+
+
+# --- B10: persistent-mode FakeSnow caching by db_path -------------------------
+#
+# When `FAKESNOW_DB_PATH` is set to a directory, every `login_request` previously
+# instantiated a fresh `FakeSnow(db_path=...)` which calls
+# `_attach_existing_databases()` and ATTACHes each `*.db` file. DuckDB enforces
+# process-wide unique file handles, so the second concurrent (or sequential
+# overlapping) login fails with:
+#
+#     _duckdb.BinderException: Unique file handle conflict:
+#         Cannot attach "<DB>" - already attached
+#
+# B10 caches `FakeSnow` instances by resolved `db_path` in `server.py` so two
+# logins against the same path share one process-wide FakeSnow (and one DuckDB
+# connection). Surfaced by D2-capture-v1 (see
+# docs/decisions/2026-04-26-d2-capture-results.md).
+
+
+def test_server_b10_persistent_db_path_two_sequential_logins(tmp_path) -> None:
+    """Two sequential client logins against the same `FAKESNOW_DB_PATH` must
+    both succeed.
+
+    Pre-fix behavior: the second `snowflake.connector.connect(...)` raises
+    `_duckdb.BinderException: Unique file handle conflict` because the second
+    `FakeSnow(db_path=...)` re-attaches the same `*.db` file the first instance
+    already holds open.
+
+    The first connection is held open for the duration of the second login so
+    the conflict is reproducible — closing it first would release the file
+    handle and let the second login succeed by accident, masking the bug.
+    """
+    # We can't reuse the package-level `fakesnow.server()` helper here: by the
+    # time this test runs, the `fakesnow.server` submodule has been imported
+    # by earlier tests / fixtures and shadows the function attribute on the
+    # package. Replicate the (small) helper inline so the test stays
+    # self-contained.
+    import contextlib
+    import socket
+    import threading
+    from time import sleep
+
+    import uvicorn
+
+    from fakesnow.server import app as fakesnow_app
+
+    db_dir = tmp_path / "fakesnow-b10"
+    db_dir.mkdir()
+
+    # FAKESNOW_DB_PATH must be visible to the server process. uvicorn runs in a
+    # thread of the same process, so an env var is the simplest reliable
+    # channel.
+    with patch.dict(os.environ, {"FAKESNOW_DB_PATH": str(db_dir)}):
+        with contextlib.closing(socket.socket(type=socket.SOCK_STREAM)) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        srv = uvicorn.Server(
+            uvicorn.Config(fakesnow_app, host="127.0.0.1", port=port, log_level="info")
+        )
+        thread = threading.Thread(target=srv.run, name="fakesnow b10 server", daemon=True)
+        thread.start()
+        try:
+            while thread.is_alive() and not srv.started:
+                sleep(0.05)
+            assert srv.started, "fakesnow server failed to start"
+
+            conn_kwargs: dict = dict(
+                user="fake",
+                password="snow",
+                account="fakesnow",
+                host="127.0.0.1",
+                port=port,
+                protocol="http",
+                session_parameters={"CLIENT_OUT_OF_BAND_TELEMETRY_ENABLED": False},
+                network_timeout=1,
+            )
+
+            # First login — creates `DB1.db` on disk via the persistent path.
+            with snowflake.connector.connect(
+                **conn_kwargs, database="db1", schema="schema1"
+            ) as conn1, conn1.cursor() as cur1:
+                cur1.execute("SELECT 1")
+                assert cur1.fetchone() == (1,)
+
+                # Second login while the first is still open. Pre-fix this
+                # raises BinderException because the second FakeSnow attaches
+                # the same DB1.db that conn1's FakeSnow already holds.
+                with snowflake.connector.connect(
+                    **conn_kwargs, database="db1", schema="schema1"
+                ) as conn2, conn2.cursor() as cur2:
+                    cur2.execute("SELECT 1")
+                    assert cur2.fetchone() == (1,)
+
+                    # Third overlapping login -- exercises refcount > 2 so a
+                    # bug that special-cased N=2 would surface here.
+                    with snowflake.connector.connect(
+                        **conn_kwargs, database="db1", schema="schema1"
+                    ) as conn3, conn3.cursor() as cur3:
+                        cur3.execute("SELECT 1")
+                        assert cur3.fetchone() == (1,)
+        finally:
+            srv.should_exit = True
+            thread.join(timeout=10)
+
+
+def _b10_login(base_url: str, db_path: str) -> str:
+    """Helper: POST to /session/v1/login-request and return the issued token.
+
+    Used by the refcount-cleanup test to exercise the full server code path
+    (login → cache-acquire → session-delete → cache-release) deterministically,
+    without depending on the snowflake-connector client to send `delete=true`
+    on `__exit__` (which it does inconsistently in test harnesses).
+    """
+    resp = requests.post(
+        f"{base_url}/session/v1/login-request",
+        json={
+            "data": {
+                "SESSION_PARAMETERS": {
+                    "FAKESNOW_DB_PATH": db_path,
+                    "CLIENT_OUT_OF_BAND_TELEMETRY_ENABLED": False,
+                }
+            }
+        },
+        timeout=5,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    assert body["success"], body
+    return body["data"]["token"]
+
+
+def _b10_session_delete(base_url: str, token: str) -> None:
+    resp = requests.post(
+        f"{base_url}/session?delete=true",
+        headers={"Authorization": f'Snowflake Token="{token}"'},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    assert resp.json()["success"]
+
+
+def test_server_b10_persistent_refcount_cleanup_cycle(tmp_path) -> None:
+    """Drive login + session(delete=true) directly via HTTP so cache cleanup is
+    exercised end-to-end.
+
+    Asserts: (a) refcount grows with logins; (b) cache entry is dropped after
+    the last session-delete; (c) a subsequent login re-creates the entry
+    (proves cleanup truly happened, not just a refcount nudge).
+    """
+    import contextlib
+    import socket
+    import threading
+    from time import sleep
+
+    import uvicorn
+
+    from fakesnow import server as _fs_server
+    from fakesnow.server import app as fakesnow_app
+
+    db_dir = tmp_path / "fakesnow-b10-cycle"
+    db_dir.mkdir()
+    db_path = str(db_dir)
+
+    with contextlib.closing(socket.socket(type=socket.SOCK_STREAM)) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    base_url = f"http://127.0.0.1:{port}"
+    srv = uvicorn.Server(
+        uvicorn.Config(fakesnow_app, host="127.0.0.1", port=port, log_level="info")
+    )
+    thread = threading.Thread(target=srv.run, name="fakesnow b10 cycle server", daemon=True)
+    thread.start()
+    try:
+        while thread.is_alive() and not srv.started:
+            sleep(0.05)
+        assert srv.started, "fakesnow server failed to start"
+
+        # Snapshot starting state so the test is order-independent w.r.t.
+        # other tests in the file -- some may have left stray cache entries.
+        starting_paths = set(_fs_server._fakesnow_instances_by_db_path.keys())
+        assert db_path not in starting_paths
+
+        # Three sequential logins: refcount climbs 1, 2, 3.
+        t1 = _b10_login(base_url, db_path)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 1
+        first_instance = _fs_server._fakesnow_instances_by_db_path[db_path]
+
+        t2 = _b10_login(base_url, db_path)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 2
+        # Same instance reused on the 2nd login (the whole point of B10).
+        assert _fs_server._fakesnow_instances_by_db_path[db_path] is first_instance
+
+        t3 = _b10_login(base_url, db_path)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 3
+
+        # Session-delete in arbitrary order; refcount decrements; entry stays.
+        _b10_session_delete(base_url, t2)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 2
+
+        _b10_session_delete(base_url, t1)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 1
+        assert _fs_server._fakesnow_instances_by_db_path[db_path] is first_instance
+
+        # Final delete drops the cache entry.
+        _b10_session_delete(base_url, t3)
+        assert db_path not in _fs_server._fakesnow_instances_by_db_path, (
+            "cache entry leaked after refcount hit zero"
+        )
+        assert db_path not in _fs_server._fakesnow_refcounts_by_db_path
+        assert t3 not in _fs_server._db_path_by_token
+
+        # New login re-creates the FakeSnow cleanly (would crash with
+        # BinderException if the prior DuckDB handle leaked).
+        t4 = _b10_login(base_url, db_path)
+        assert _fs_server._fakesnow_refcounts_by_db_path[db_path] == 1
+        new_instance = _fs_server._fakesnow_instances_by_db_path[db_path]
+        assert new_instance is not first_instance, (
+            "new login reused the closed FakeSnow instance instead of recreating it"
+        )
+        _b10_session_delete(base_url, t4)
+        assert db_path not in _fs_server._fakesnow_instances_by_db_path
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_server_b10_persistent_distinct_db_paths_independent(tmp_path) -> None:
+    """Two persistent logins against DIFFERENT db_paths must produce two
+    independent cache entries that can coexist.
+
+    Guards against a regression that keys the cache on a constant or otherwise
+    collapses distinct paths into one entry. Driven via direct HTTP so cleanup
+    is verifiable (the snowflake-connector test harness doesn't reliably send
+    session(delete=true) on `__exit__`).
+    """
+    import contextlib
+    import socket
+    import threading
+    from time import sleep
+
+    import uvicorn
+
+    from fakesnow import server as _fs_server
+    from fakesnow.server import app as fakesnow_app
+
+    db_dir_a = tmp_path / "fakesnow-b10-a"
+    db_dir_b = tmp_path / "fakesnow-b10-b"
+    db_dir_a.mkdir()
+    db_dir_b.mkdir()
+    path_a, path_b = str(db_dir_a), str(db_dir_b)
+
+    with contextlib.closing(socket.socket(type=socket.SOCK_STREAM)) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    base_url = f"http://127.0.0.1:{port}"
+    srv = uvicorn.Server(
+        uvicorn.Config(fakesnow_app, host="127.0.0.1", port=port, log_level="info")
+    )
+    thread = threading.Thread(target=srv.run, name="fakesnow b10 distinct server", daemon=True)
+    thread.start()
+    try:
+        while thread.is_alive() and not srv.started:
+            sleep(0.05)
+        assert srv.started, "fakesnow server failed to start"
+
+        token_a = _b10_login(base_url, path_a)
+        token_b = _b10_login(base_url, path_b)
+
+        # Two distinct cache entries, each refcount==1, distinct instances.
+        assert path_a in _fs_server._fakesnow_instances_by_db_path
+        assert path_b in _fs_server._fakesnow_instances_by_db_path
+        assert (
+            _fs_server._fakesnow_instances_by_db_path[path_a]
+            is not _fs_server._fakesnow_instances_by_db_path[path_b]
+        )
+        assert _fs_server._fakesnow_refcounts_by_db_path[path_a] == 1
+        assert _fs_server._fakesnow_refcounts_by_db_path[path_b] == 1
+
+        # Closing one path's session leaves the other intact.
+        _b10_session_delete(base_url, token_a)
+        assert path_a not in _fs_server._fakesnow_instances_by_db_path
+        assert path_b in _fs_server._fakesnow_instances_by_db_path
+
+        _b10_session_delete(base_url, token_b)
+        assert path_b not in _fs_server._fakesnow_instances_by_db_path
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=10)

@@ -42,6 +42,35 @@ if TYPE_CHECKING:
     from fakesnow.conn import FakeSnowflakeConnection
 
 
+def _identity_transform(expression: Expr) -> Expr:
+    """No-op transform used in place of upper_case_unquoted_identifiers when
+    FakeSnowflakeConnection.preserve_identifier_case is True. Defined at module
+    level so we don't allocate a new lambda per execute call."""
+    return expression
+
+
+# Matches a qmark placeholder followed by Snowflake/DuckDB-style ::TYPE cast.
+# sqlglot's snowflake/duckdb parser does not accept ``?::TYPE`` — only literal
+# or named-placeholder forms (e.g. ``$1::TYPE``, ``'abc'::TYPE``) parse. Drivers
+# that bind by position (notably the Node snowflake-sdk and Slonik via the
+# PR-313 wire server) emit ``?::TIMESTAMP`` after their own placeholder
+# substitution, so we rewrite to ``CAST(? AS TYPE)`` before handing the SQL
+# to sqlglot. The captured TYPE is reinjected verbatim, so any qualifier
+# DuckDB/Snowflake supports (``TIMESTAMP_NTZ``, ``NUMBER(10,2)``, ``VARCHAR``,
+# etc.) is preserved.
+#
+# Type pattern accepts a leading identifier with optional schema-qualified
+# parts and an optional parenthesised parameter list (precision/scale).
+_QMARK_CAST_RE = re.compile(
+    r"\?::([A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?)",
+)
+
+
+def _rewrite_qmark_casts(sql: str) -> str:
+    """Rewrite ``?::TYPE`` to ``CAST(? AS TYPE)``. See _QMARK_CAST_RE comment."""
+    return _QMARK_CAST_RE.sub(r"CAST(? AS \1)", sql)
+
+
 SCHEMA_UNSET = "schema_unset"
 SQL_SUCCESS = "SELECT 'Statement executed successfully.' as 'status'"
 SQL_CREATED_DATABASE = Template("SELECT 'Database ${name} successfully created.' as 'status'")
@@ -158,6 +187,10 @@ class FakeSnowflakeCursor:
                 print(f"{command};params={p}" if p else f"{command};", file=sys.stderr)
 
             command = self._inline_variables(command)
+            # Rewrite ?::TYPE -> CAST(? AS TYPE) so sqlglot can parse it. Drivers that
+            # bind by position (Node snowflake-sdk, Slonik via PR-313 server) emit this
+            # form, but sqlglot's snowflake/duckdb parser rejects ?::TYPE.
+            command = _rewrite_qmark_casts(command)
             if kwargs.get("binding_params"):
                 # params have come via the server
                 params = kwargs["binding_params"]
@@ -247,9 +280,18 @@ class FakeSnowflakeCursor:
             )
 
     def _transform(self, expression: Expr, params: MutableParams | None) -> Expr:
+        # When the connection opts into preserving identifier case, the
+        # upper_case_unquoted_identifiers transform is replaced by a module-level
+        # no-op so DuckDB's natural (lower) casing reaches the cursor. Otherwise the
+        # default Snowflake-mimicking upper-casing pass runs.
+        identifier_case_transform = (
+            _identity_transform
+            if self._conn.preserve_identifier_case
+            else transforms.upper_case_unquoted_identifiers
+        )
         return (
             expression.transform(lambda e: transforms.identifier(e, params))
-            .transform(transforms.upper_case_unquoted_identifiers)
+            .transform(identifier_case_transform)
             .transform(transforms.alter_session)
             .transform(transforms.update_variables, variables=self._conn.variables)
             .transform(transforms.current_version)
@@ -314,6 +356,7 @@ class FakeSnowflakeCursor:
             .transform(transforms.hex_string)
             .transform(transforms.sha256)
             .transform(transforms.create_clone)
+            .transform(transforms.create_temp_view_strip_qualifier)
             .transform(transforms.alias_in_join)
             .transform(transforms.alter_table_strip_cluster_by)
             .transform(transforms.numeric_agg_implicit_cast)

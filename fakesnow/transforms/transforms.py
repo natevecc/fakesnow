@@ -156,6 +156,52 @@ def create_clone(expression: Expr) -> Expr:
     return expression
 
 
+def create_temp_view_strip_qualifier(expression: Expr) -> Expr:
+    """Strip db/schema qualifier from CREATE [OR REPLACE] TEMP[ORARY] VIEW statements.
+
+    Snowflake accepts a fully-qualified name (``db.schema.x``) on a temporary view but the
+    object is still session-local — the qualifier is effectively ignored. DuckDB rejects it
+    outright with ``Parser Error: TEMPORARY table names can *only* use the "temp" catalog``,
+    which fires on every incremental dbt rebuild after the first run because dbt emits
+    ``CREATE OR REPLACE TEMPORARY VIEW <db>.<schema>.<model>__dbt_tmp ...``.
+
+    We rewrite the CREATE so DuckDB places the view in its session-local ``temp`` catalog;
+    dbt's follow-up ``SELECT ... FROM <model>__dbt_tmp`` resolves there because DuckDB
+    searches the temp catalog ahead of attached databases.
+
+    Limitation: a downstream ``SELECT ... FROM <db>.<schema>.<model>__dbt_tmp`` that re-uses
+    the original 3-part qualifier will resolve on Snowflake but raise ``CatalogException``
+    on DuckDB (the temp catalog cannot be addressed via an attached-database name). dbt does
+    not emit this pattern; if a caller does, it must reference the temp view unqualified
+    or via ``temp.main.<x>``.
+
+    Example:
+        >>> import sqlglot
+        >>> sqlglot.parse_one(
+        ...     "CREATE OR REPLACE TEMPORARY VIEW mydb.gold.x__dbt_tmp AS SELECT 1",
+        ...     read="snowflake",
+        ... ).transform(create_temp_view_strip_qualifier).sql()
+        'CREATE OR REPLACE TEMPORARY VIEW x__dbt_tmp AS SELECT 1'
+    """
+
+    if (
+        isinstance(expression, exp.Create)
+        and str(expression.args.get("kind")).upper() == "VIEW"
+        and (props := expression.args.get("properties"))
+        and any(isinstance(p, exp.TemporaryProperty) for p in props.expressions)
+        and isinstance(expression.this, exp.Table)
+        and (expression.this.args.get("db") or expression.this.args.get("catalog"))
+    ):
+        new = expression.copy()
+        table = new.this
+        assert isinstance(table, exp.Table)
+        table.set("db", None)
+        table.set("catalog", None)
+        return new
+
+    return expression
+
+
 def current_version(expression: Expr) -> Expr:
     """Return a Snowflake-compatible server version string instead of the DuckDB version.
 
@@ -221,7 +267,7 @@ SELECT
     NULL::VARCHAR AS "comment",
     NULL::VARCHAR AS "policy name",
     NULL::JSON AS "privacy domain",
-FROM _fs_information_schema._fs_columns
+FROM ${catalog}._fs_information_schema._fs_columns
 WHERE table_catalog = '${catalog}' AND table_schema = '${schema}' AND table_name = '${table}'
 ORDER BY ordinal_position
 """
@@ -871,6 +917,114 @@ def object_construct(expression: Expr) -> Expr:
     )
 
 
+# DuckDB's RE2 REGEXP engine recognizes only a fixed set of `\X` escape sequences and raises
+# `Invalid Input Error: invalid escape sequence: \X` for any other letter/digit. Snowflake's
+# regex engine silently treats unknown escapes as the literal character (so `\M` matches `M`).
+# We probed every ASCII letter/digit/special against duckdb to determine which escapes are
+# actually accepted, and the safe set differs by context: inside `[...]` character classes
+# RE2 is strict; only character-class-producing escapes pass.
+#
+# For any escape outside the safe set, we drop the leading backslash so duckdb sees the bare
+# literal char — matching Snowflake's "unknown escape = literal" semantics.
+
+# Letters accepted at the TOP LEVEL (outside character classes) AND whose meaning matches
+# Snowflake's regex semantics. Includes anchors (\A, \B, \b, \z, \Z) and class shortcuts
+# (\d, \D, \w, \W, \s, \S) plus \f \n \r \t which both engines treat identically.
+#
+# DELIBERATELY EXCLUDED even though DuckDB accepts them, because Snowflake treats them as
+# the literal char (and we must too):
+#   \a — DuckDB: BEL byte (0x07);   Snowflake: literal 'a'
+#   \v — DuckDB: vertical tab;       Snowflake: literal 'v'
+#   \C — DuckDB: "any byte" matcher; Snowflake: literal 'C'
+#   \p — DuckDB: needs \p{name};     Snowflake: literal 'p'
+#   \P — DuckDB: needs \P{name};     Snowflake: literal 'P'
+#   \Q — DuckDB: literal-quote start; Snowflake: literal 'Q'  (\Q...\E is unsupported by Snowflake)
+#
+# Probed empirically against duckdb via:
+#   duckdb.connect().execute("SELECT regexp_extract('x', ?)", [r"\<X>"]).fetchall()
+# If a future DuckDB release changes the accepted-escape set, re-run the probe and update.
+_DUCKDB_SAFE_REGEX_LETTERS_TOP: frozenset[str] = frozenset("bdfnrstwzABDSW")
+
+# Letters accepted INSIDE `[...]` character classes. RE2 disallows anchors and \C/\Q/\B/\b/\A/\z
+# inside char classes, so the inside set is a strict subset of the top-level set. Excludes
+# letters that DuckDB accepts but with semantics divergent from Snowflake (\a, \v).
+_DUCKDB_SAFE_REGEX_LETTERS_IN_CLASS: frozenset[str] = frozenset("dfnrstwDSW")
+
+# Non-letter chars that are always safe to leave preceded by a backslash, in BOTH the top-level
+# and in-class contexts. Includes regex metacharacters (so users can escape `.`, `*`, etc.),
+# punctuation, the digit 0 (NUL byte), and the backslash itself. Digits 1-9 are backref syntax
+# (rejected by DuckDB outside specific contexts) and get stripped.
+_DUCKDB_SAFE_REGEX_NONLETTERS: frozenset[str] = frozenset(
+    "0" + r".*+?()[]{}|^$\\\"'/-_!@#%&" + ":;<>=,~`"
+)
+
+
+def _normalize_regex_pattern(pattern: str) -> str:
+    r"""Strip the leading backslash from `\<unknown>` sequences so DuckDB sees the literal char,
+    matching Snowflake's "unknown escape = literal" behavior.
+
+    Walks the pattern char-by-char tracking whether we're inside a `[...]` character class
+    (RE2's accepted-escape set is much narrower inside classes). On a backslash, looks at the
+    next char:
+
+    * If next char is in the context-appropriate safe set, the `\X` pair passes through
+      unchanged (so `\d`, `\w`, `\.`, accepted anchors, etc. keep working).
+    * Otherwise the backslash is dropped and only the bare char is emitted, so DuckDB parses
+      e.g. `\M` as the literal `M` (Snowflake semantics).
+
+    A trailing lone backslash is left as-is (DuckDB raises on it, matching what would happen
+    on real Snowflake too). Char-class state is bracket-depth aware: nested-looking
+    `[abc[def]]` would not occur in valid PCRE/RE2 but the simple `in_class` flag handles
+    the common case correctly because `]` only closes the class once.
+
+    Known limitations (out of scope — Snowflake doesn't support these constructs, or fixing
+    them would require a separate transform):
+    * `\Q...\E` literal-quoting blocks: helper does not detect them. Snowflake doesn't
+      support `\Q\E`, so the corruption is academic.
+    * `[]]` (literal `]` as first char of class) and other RE2-grammar edge cases: the
+      simple `[`/`]` toggle does not implement the full RE2 grammar.
+    * Snowflake-only escapes `\xhh`, `\Uhhhhhhhh`, `\Z` are stripped to literals because
+      DuckDB rejects them in their bare form. If Cerner or other production patterns ever
+      rely on these, a separate transform converting them to DuckDB's accepted syntax
+      (e.g. `\xff` -> `\x{ff}`) would be needed.
+    """
+    if "\\" not in pattern:
+        return pattern
+
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = pattern[i + 1]
+            if nxt.isalpha():
+                safe_letters = _DUCKDB_SAFE_REGEX_LETTERS_IN_CLASS if in_class else _DUCKDB_SAFE_REGEX_LETTERS_TOP
+                if nxt in safe_letters:
+                    out.append(ch)
+                    out.append(nxt)
+                else:
+                    # drop the backslash so duckdb sees the literal char (snowflake semantics)
+                    out.append(nxt)
+            elif nxt in _DUCKDB_SAFE_REGEX_NONLETTERS:
+                out.append(ch)
+                out.append(nxt)
+            else:
+                # unknown non-letter escape (e.g. digits 1-9 = backref syntax) — drop backslash
+                out.append(nxt)
+            i += 2
+            continue
+        # track char-class bracket state. `[` opens, `]` closes (RE2 doesn't nest).
+        if ch == "[" and not in_class:
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def regex_replace(expression: Expr) -> Expr:
     """Transform regex_replace expressions from snowflake to duckdb."""
 
@@ -883,9 +1037,8 @@ def regex_replace(expression: Expr) -> Expr:
 
         # pattern: snowflake requires escaping backslashes in single-quoted string constants, but duckdb doesn't
         # see https://docs.snowflake.com/en/sql-reference/functions-regexp#label-regexp-escape-character-caveats
-        expression.args["expression"] = exp.Literal(
-            this=expression.expression.this.replace("\\\\", "\\"), is_string=True
-        )
+        normalized = _normalize_regex_pattern(expression.expression.this.replace("\\\\", "\\"))
+        expression.args["expression"] = exp.Literal(this=normalized, is_string=True)
 
         if not expression.args.get("replacement"):
             # if no replacement string, the snowflake default is ''
@@ -908,19 +1061,18 @@ def regex_substr(expression: Expr) -> Expr:
 
         # pattern: snowflake requires escaping backslashes in single-quoted string constants, but duckdb doesn't
         # see https://docs.snowflake.com/en/sql-reference/functions-regexp#label-regexp-escape-character-caveats
+        # additionally, pre-escape any `\<unknown>` sequences so duckdb treats them as literal
+        # (snowflake's silent-literal semantics; duckdb otherwise raises `invalid escape sequence`)
         pattern = expression.expression
-        pattern.args["this"] = pattern.this.replace("\\\\", "\\")
+        pattern.args["this"] = _normalize_regex_pattern(pattern.this.replace("\\\\", "\\"))
 
         # number of characters from the beginning of the string where the function starts searching for matches
         position = expression.args["position"] or exp.Literal(this="1", is_string=False)
 
-        # which occurrence of the pattern to match
-        occurrence = expression.args["occurrence"]
-        occurrence = int(occurrence.this) if occurrence else 1
-
-        # the duckdb dialect increments bracket (ie: index) expressions by 1 because duckdb is 1-indexed,
-        # so we need to compensate by subtracting 1
-        occurrence = exp.Literal(this=str(occurrence - 1), is_string=False)
+        # which occurrence of the pattern to match. Snowflake is 1-indexed; defaults to 1.
+        # Duckdb is also 1-indexed at the bracket surface, so the snowflake value can be passed
+        # through verbatim once we neutralize the duckdb dialect's automatic +1 (see below).
+        occurrence = expression.args["occurrence"] or exp.Literal(this="1", is_string=False)
 
         has_e_param = False
         if parameters := expression.args["parameters"]:
@@ -952,8 +1104,14 @@ def regex_substr(expression: Expr) -> Expr:
                     regex_parameters,
                 ],
             ),
-            # select index of occurrence
+            # select index of occurrence. The duckdb dialect's bracket_sql adds +1 to the index
+            # whenever its type resolves to INTEGER (literals fold via simplify; typed sub-exprs
+            # render as `<expr> + 1`). Setting offset=1 cancels that out (net offset becomes 0),
+            # so the snowflake-supplied 1-indexed occurrence — whether literal, column ref,
+            # arithmetic, scalar subquery, or cast — passes through verbatim and indexes the
+            # 1-indexed duckdb array surface correctly.
             expressions=[occurrence],
+            offset=1,
         )
 
     return expression

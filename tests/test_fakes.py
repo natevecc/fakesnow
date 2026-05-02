@@ -188,6 +188,36 @@ def test_create_table_as(dcur: snowflake.connector.cursor.SnowflakeCursor) -> No
     assert dcur.fetchall() == [{"ID": "1"}]
 
 
+def test_create_temp_view_three_part_name(dcur: snowflake.connector.cursor.SnowflakeCursor):
+    """dbt's incremental rebuild emits ``CREATE OR REPLACE TEMPORARY VIEW <db>.<schema>.<x>__dbt_tmp``.
+    Snowflake accepts the qualifier (the view is still session-local), but DuckDB rejects it.
+    fakesnow strips the qualifier so DuckDB places the view in its session-local ``temp`` catalog,
+    and the follow-up ``SELECT * FROM <x>__dbt_tmp`` resolves there.
+    """
+
+    dcur.execute(
+        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 1 AS col"
+    )
+    dcur.execute("SELECT * FROM test_view__dbt_tmp")
+    assert dcur.fetchall() == [{"COL": 1}]
+
+    # Re-issuing the same CREATE OR REPLACE (the dbt rebuild after first run) must succeed too.
+    dcur.execute(
+        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 2 AS col"
+    )
+    dcur.execute("SELECT * FROM test_view__dbt_tmp")
+    assert dcur.fetchall() == [{"COL": 2}]
+
+    # After USE <db>.<schema>, the unqualified follow-up SELECT must still resolve via DuckDB's
+    # temp catalog (which is searched ahead of attached databases).
+    dcur.execute("USE SCHEMA db1.schema1")
+    dcur.execute(
+        "CREATE OR REPLACE TEMPORARY VIEW db1.schema1.test_view__dbt_tmp AS SELECT 3 AS col"
+    )
+    dcur.execute("SELECT * FROM test_view__dbt_tmp")
+    assert dcur.fetchall() == [{"COL": 3}]
+
+
 def test_dateadd_date_cast(dcur: snowflake.connector.DictCursor):
     q = """
     SELECT
@@ -410,6 +440,175 @@ def test_quoted_identifiers_ignore_case(dcur: snowflake.connector.cursor.Snowfla
     assert "not implemented" in str(excinfo.value)
 
 
+def test_preserve_identifier_case_default_uppercase(_fakesnow: None) -> None:
+    """Without the FAKESNOW_PRESERVE_IDENTIFIER_CASE opt-in, fakesnow upper-cases
+    unquoted identifiers in result metadata to match Snowflake's default behavior."""
+    with snowflake.connector.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
+        assert [d.name for d in cur.description] == ["MY_COL", "ANOTHER_COL"]
+
+
+def test_preserve_identifier_case_opt_in_lowercase(_fakesnow: None) -> None:
+    """With FAKESNOW_PRESERVE_IDENTIFIER_CASE=True passed via session_parameters,
+    unquoted identifiers retain their authored casing in result metadata. This is a
+    fakesnow-specific ergonomic toggle (not a Snowflake-canonical session param)
+    for callers that author SQL with intentionally lower-cased aliases."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+    ) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
+        assert [d.name for d in cur.description] == ["my_col", "another_col"]
+
+
+def test_preserve_identifier_case_opt_in_lowercase_dict_cursor(_fakesnow: None) -> None:
+    """With the opt-in, dict-cursor row keys are also lower-cased to match the
+    description. This is the path the Phrase replay code reads."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+    ) as conn, conn.cursor(snowflake.connector.cursor.DictCursor) as dcur:
+        dcur.execute("SELECT 1 AS my_col, 2 AS another_col")
+        row = dcur.fetchone()
+        assert row == {"my_col": 1, "another_col": 2}
+
+
+def test_preserve_identifier_case_kwarg(_fakesnow: None) -> None:
+    """The preserve_identifier_case kwarg is equivalent to the session-parameter
+    path. Using the kwarg directly is the cleaner Python API for callers that own
+    the FakeSnow instance."""
+    import fakesnow.fakes as fakes
+    from fakesnow.instance import FakeSnow
+
+    fs = FakeSnow()
+    try:
+        conn = fs.connect("db1", "schema1", preserve_identifier_case=True)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 AS my_col")
+            assert [d.name for d in cur.description] == ["my_col"]
+        finally:
+            conn.close()
+    finally:
+        fs.duck_conn.close()
+    assert isinstance(fs, FakeSnow)
+    assert isinstance(conn, fakes.FakeSnowflakeConnection)
+
+
+def test_preserve_identifier_case_kwarg_false_overrides_session_param(_fakesnow: None) -> None:
+    """When the kwarg is explicitly False, it wins over a True session_parameter.
+    Pinning the documented 'kwarg wins when explicitly provided' precedence so an
+    accidental flip in the resolution logic regresses loudly."""
+    from fakesnow.instance import FakeSnow
+
+    fs = FakeSnow()
+    try:
+        conn = fs.connect(
+            "db1",
+            "schema1",
+            preserve_identifier_case=False,
+            session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True},
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 AS my_col")
+            # Explicit kwarg=False wins -> default upper-casing applies.
+            assert [d.name for d in cur.description] == ["MY_COL"]
+        finally:
+            conn.close()
+    finally:
+        fs.duck_conn.close()
+
+
+def test_preserve_identifier_case_string_false_disables(_fakesnow: None) -> None:
+    """The string 'false' (case-insensitive) is treated as falsy by the boolean
+    coercion helper, so a YAML/JSON config that round-trips through string forms
+    behaves intuitively rather than the Python-truthy default."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": "false"}
+    ) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 AS my_col")
+        assert [d.name for d in cur.description] == ["MY_COL"]
+
+
+def test_preserve_identifier_case_string_true_enables(_fakesnow: None) -> None:
+    """The string 'true' (case-insensitive) enables the flag, mirroring the
+    string-coercion handling for 'false'."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": "TRUE"}
+    ) as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 AS my_col")
+        assert [d.name for d in cur.description] == ["my_col"]
+
+
+def test_preserve_identifier_case_quoted_identifiers_preserved(_fakesnow: None) -> None:
+    """Quoted identifiers are preserved as-typed regardless of the flag (DuckDB
+    behavior). Mixed quoted/unquoted in one SELECT pins both branches at once."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+    ) as conn, conn.cursor() as cur:
+        cur.execute('SELECT 1 AS "MyCol", 2 AS another_col, 3 AS "lower_quoted"')
+        assert [d.name for d in cur.description] == ["MyCol", "another_col", "lower_quoted"]
+
+
+def test_preserve_identifier_case_mixed_case_alias_preserved(_fakesnow: None) -> None:
+    """Under the opt-in, mixed-case unquoted aliases are preserved as-typed.
+    DuckDB does NOT lowercase unquoted alias identifiers (it preserves their
+    literal casing for alias positions). This pins the actual observed behavior
+    so the writeup and any consumer documentation stay accurate."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+    ) as conn, conn.cursor() as cur:
+        cur.execute('SELECT 1 AS My_Col, 2 AS UPPER_COL, 3 AS "QuotedCol"')
+        assert [d.name for d in cur.description] == ["My_Col", "UPPER_COL", "QuotedCol"]
+
+
+def test_preserve_identifier_case_alter_session_not_supported(_fakesnow: None) -> None:
+    """The flag is read once at connect time. ALTER SESSION SET on it is rejected
+    by fakesnow's existing alter_session transform (raises ProgrammingError).
+    Pinning so a future contributor doesn't accidentally route ALTER SESSION on
+    this name through and create the impression of mid-session toggling."""
+    with snowflake.connector.connect() as conn, conn.cursor() as cur:
+        with pytest.raises(snowflake.connector.errors.ProgrammingError) as excinfo:
+            cur.execute("ALTER SESSION SET FAKESNOW_PRESERVE_IDENTIFIER_CASE = TRUE")
+        assert "not implemented" in str(excinfo.value).lower()
+
+
+def test_preserve_identifier_case_shared_across_cursors(_fakesnow: None) -> None:
+    """Multiple cursors on the same connection share the connection-level flag
+    value. Pins that the resolution is per-connection, not per-cursor."""
+    with snowflake.connector.connect(
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True}
+    ) as conn:
+        with conn.cursor() as cur1, conn.cursor() as cur2:
+            cur1.execute("SELECT 1 AS first_col")
+            cur2.execute("SELECT 2 AS second_col")
+            assert cur1.description[0].name == "first_col"
+            assert cur2.description[0].name == "second_col"
+
+
+def test_preserve_identifier_case_select_star_returns_stored_casing(_fakesnow: None) -> None:
+    """SELECT * returns the column names as stored in the table, regardless of
+    the flag. A table created without the flag stores upper-cased columns; a
+    later session with the flag on gets the upper-cased names back from SELECT *.
+    Documented trade-off; pinned to surface drift if SELECT * handling changes."""
+    # Create with flag OFF: columns stored upper.
+    with snowflake.connector.connect(database="db1", schema="schema1") as conn, conn.cursor() as cur:
+        cur.execute("CREATE TABLE cf_test (col_a INT, col_b INT)")
+        cur.execute("INSERT INTO cf_test VALUES (1, 2)")
+        cur.execute("SELECT col_a FROM cf_test")
+        assert cur.description[0].name == "COL_A"
+
+    # Reconnect with flag ON; SELECT * still returns upper because the underlying
+    # table was created with the upper-casing pass on.
+    with snowflake.connector.connect(
+        database="db1",
+        schema="schema1",
+        session_parameters={"FAKESNOW_PRESERVE_IDENTIFIER_CASE": True},
+    ) as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM cf_test")
+        assert [d.name for d in cur.description] == ["COL_A", "COL_B"]
+        cur.execute("DROP TABLE cf_test")
+
+
 def test_regex(cur: snowflake.connector.cursor.SnowflakeCursor):
     cur.execute("select regexp_replace('abc123', '\\\\D', '')")
     assert cur.fetchone() == ("123",)
@@ -432,6 +631,88 @@ def test_regex_substr(cur: snowflake.connector.cursor.SnowflakeCursor):
     # see https://github.com/tekumara/fakesnow/issues/289
     cur.execute(f"select regexp_substr('{string1}', 'the\\\\W+(\\\\w+)', 1, 1, 'e')")
     assert cur.fetchone() == ("best",)
+
+
+def test_regex_substr_non_literal_occurrence(cur: snowflake.connector.cursor.SnowflakeCursor):
+    # dbt-snowflake's dynamic_table materialization passes a column ref (eg `g.seq` from
+    # JOIN LATERAL TABLE(GENERATOR(ROWCOUNT => N))) for the occurrence arg. fakesnow used to
+    # call `int(occurrence.this)` unconditionally, raising TypeError on non-literal args.
+
+    # column ref: pick the 1st, 2nd, 3rd "abc"-pattern match per row
+    cur.execute(
+        "select regexp_substr('a1b2c3', '[a-z]', 1, g.seq) "
+        "from (select 1 as seq union all select 2 as seq union all select 3 as seq) g "
+        "order by g.seq"
+    )
+    assert cur.fetchall() == [("a",), ("b",), ("c",)]
+
+    # arithmetic on a column ref: occurrence = g.seq + 1
+    cur.execute(
+        "select regexp_substr('a1b2c3', '[a-z]', 1, g.seq + 1) "
+        "from (select 0 as seq union all select 1 as seq) g "
+        "order by g.seq"
+    )
+    assert cur.fetchall() == [("a",), ("b",)]
+
+    # scalar subquery as occurrence
+    cur.execute("select regexp_substr('a1b2c3', '[a-z]', 1, (select 2))")
+    assert cur.fetchone() == ("b",)
+
+    # explicit NULL occurrence — Snowflake returns NULL; duckdb's `[NULL]` also returns NULL
+    cur.execute("select regexp_substr('a1b2c3', '[a-z]', 1, NULL)")
+    assert cur.fetchone() == (None,)
+
+
+def test_regex_unknown_escape_treated_literal(cur: snowflake.connector.cursor.SnowflakeCursor):
+    # Snowflake silently treats `\<unknown>` as the literal char; DuckDB's RE2 raises
+    # `invalid escape sequence: \M`. fakesnow must pre-escape unknown `\X` to `\\X`
+    # so DuckDB sees a literal X. Cerner's EKS-blob parser uses `\M`, `\O`, etc.
+    # as field markers in patterns like `'\\M([^\\]+)\\C\\d+\\O\\d+'`.
+
+    # single unknown letter — \M should match literal M
+    cur.execute(r"select regexp_substr('XMY', '\\M')")
+    assert cur.fetchone() == ("M",)
+
+    # \O likewise (also rejected by DuckDB)
+    cur.execute(r"select regexp_substr('foOd', '\\O')")
+    assert cur.fetchone() == ("O",)
+
+    # multiple unknowns in one pattern — \M then \O
+    cur.execute(r"select regexp_substr('abMxOcd', '\\M.\\O')")
+    assert cur.fetchone() == ("MxO",)
+
+    # mixed unknown + known escape — \d still works as digit class, \M as literal M
+    cur.execute(r"select regexp_substr('foo7Mbar', '\\d\\M')")
+    assert cur.fetchone() == ("7M",)
+
+    # regexp_replace path: replace literal M with X
+    cur.execute(r"select regexp_replace('aMbMc', '\\M', 'X')")
+    assert cur.fetchone() == ("aXbXc",)
+
+    # known escape inside regexp_replace must keep working as a class
+    cur.execute(r"select regexp_replace('a1b2c3', '\\d', '#')")
+    assert cur.fetchone() == ("a#b#c#",)
+
+    # the cerner-blob field-marker pattern shape (mnemonic / orderable_id) — both \M and \O
+    # unknown to duckdb. Group 1 captures everything between the M and O markers.
+    cur.execute(r"select regexp_substr('Mfoo bar O123', '\\M([^O]+)\\O(\\d+)', 1, 1, 'e', 1)")
+    assert cur.fetchone() == ("foo bar ",)
+
+    # \C must be treated as literal C, not DuckDB's "any byte" matcher (Snowflake semantics).
+    # If \C were left intact, this would match the leading 'X' (any byte) instead of 'C'.
+    cur.execute(r"select regexp_substr('XCY', '\\C')")
+    assert cur.fetchone() == ("C",)
+
+    # \p must be treated as literal p, not DuckDB's unicode property class (which requires
+    # \p{name} syntax and rejects bare \p with `invalid character class range: \p`).
+    cur.execute(r"select regexp_substr('apple', '\\p')")
+    assert cur.fetchone() == ("p",)
+
+    # Inside a character class, unknown escapes also get stripped (in-class safe set differs).
+    cur.execute(r"select regexp_substr('aMb', '[\\M]')")
+    assert cur.fetchone() == ("M",)
+    cur.execute(r"select regexp_substr('aMbcM', '[^\\M]+')")
+    assert cur.fetchone() == ("a",)
 
 
 def test_random(cur: snowflake.connector.cursor.SnowflakeCursor):
@@ -528,6 +809,56 @@ def test_to_date(cur: snowflake.connector.cursor.SnowflakeCursor):
         "SELECT to_date(to_timestamp(0)), to_date(cast(to_timestamp(0) as timestamp(9))), to_date('2024-01-26')"
     )
     assert cur.fetchall() == [(datetime.date(1970, 1, 1), datetime.date(1970, 1, 1), datetime.date(2024, 1, 26))]
+
+
+def test_qmark_cast_on_bind_param(cur: snowflake.connector.cursor.SnowflakeCursor):
+    """Bind-parameter cast syntax (e.g. ?::TIMESTAMP) should be rewritten to CAST(? AS TIMESTAMP)
+    before being parsed.
+
+    sqlglot's snowflake/duckdb parser does not accept ``?::TYPE`` (only literal/identifier
+    forms like ``$1::TYPE`` parse). Drivers (notably the Node snowflake-sdk and Slonik via the
+    PR-313 wire server) routinely emit ``?::TIMESTAMP`` after their own placeholder substitution.
+    All assertions exercise the server path (``binding_params`` kwarg) since that is the path
+    where ``?::TYPE`` originates in production; the rewrite runs before the param branch so it
+    also covers any local qmark-paramstyle clients that emit the same form.
+    """
+    # ?::TIMESTAMP round-trip
+    cur.execute("CREATE OR REPLACE TABLE ts_bind (ts TIMESTAMP)")
+    cur.execute("INSERT INTO ts_bind (ts) VALUES (?::TIMESTAMP)", binding_params=("2024-01-01 12:00:00",))
+    cur.execute("SELECT ts FROM ts_bind")
+    assert cur.fetchall() == [(datetime.datetime(2024, 1, 1, 12, 0),)]
+
+    # NULL bind value should still be accepted
+    cur.execute("INSERT INTO ts_bind (ts) VALUES (?::TIMESTAMP)", binding_params=(None,))
+    cur.execute("SELECT ts FROM ts_bind ORDER BY ts NULLS LAST")
+    assert cur.fetchall() == [(datetime.datetime(2024, 1, 1, 12, 0),), (None,)]
+
+    # ?::DATE on bind param should also work (same parser limitation, same fix)
+    cur.execute("CREATE OR REPLACE TABLE d_bind (d DATE)")
+    cur.execute("INSERT INTO d_bind (d) VALUES (?::DATE)", binding_params=("2024-03-28",))
+    cur.execute("SELECT d FROM d_bind")
+    assert cur.fetchall() == [(datetime.date(2024, 3, 28),)]
+
+    # ?::VARCHAR — proves the rewrite is type-agnostic, not TIMESTAMP-specific
+    cur.execute("CREATE OR REPLACE TABLE v_bind (v VARCHAR)")
+    cur.execute("INSERT INTO v_bind (v) VALUES (?::VARCHAR)", binding_params=("hello",))
+    cur.execute("SELECT v FROM v_bind")
+    assert cur.fetchall() == [("hello",)]
+
+    # ?::NUMBER(10,2) — exercises the optional `(...)` parameter arm of the regex
+    cur.execute("CREATE OR REPLACE TABLE n_bind (n NUMBER(10,2))")
+    cur.execute("INSERT INTO n_bind (n) VALUES (?::NUMBER(10,2))", binding_params=("12.34",))
+    cur.execute("SELECT n FROM n_bind")
+    assert cur.fetchall() == [(Decimal("12.34"),)]
+
+    # multiple ?:: in one statement — verify global re.sub handles each in order
+    cur.execute("CREATE OR REPLACE TABLE multi_bind (i INT, ts TIMESTAMP)")
+    cur.execute(
+        "INSERT INTO multi_bind (i, ts) VALUES (?::INT, ?::TIMESTAMP)",
+        binding_params=("42", "2024-05-01 09:00:00"),
+    )
+    cur.execute("SELECT i, ts FROM multi_bind")
+    assert cur.fetchall() == [(42, datetime.datetime(2024, 5, 1, 9, 0))]
 
 
 def test_to_decimal(cur: snowflake.connector.cursor.SnowflakeCursor):
