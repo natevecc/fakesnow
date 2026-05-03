@@ -234,33 +234,6 @@ def test_server_nop_regexes(server: dict) -> None:
         assert cur.fetchall() == [("Statement executed successfully.",)]
 
 
-def test_server_preserve_identifier_case_default(server: dict) -> None:
-    """Default behavior over the HTTP server path: unquoted identifiers in cursor
-    description are upper-cased, mimicking real Snowflake."""
-    server_default = {**server, "session_parameters": {**server["session_parameters"]}}
-    with snowflake.connector.connect(**server_default, database="db1", schema="schema1") as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
-        assert [d.name for d in cur.description] == ["MY_COL", "ANOTHER_COL"]
-
-
-def test_server_preserve_identifier_case_opt_in(server: dict) -> None:
-    """The FAKESNOW_PRESERVE_IDENTIFIER_CASE session parameter survives the HTTP
-    login round-trip and reaches FakeSnowflakeConnection so cursor description
-    returns lower-cased names. This is the end-to-end path for HTTP-mode clients."""
-    server_with_flag = {
-        **server,
-        "session_parameters": {
-            **server["session_parameters"],
-            "FAKESNOW_PRESERVE_IDENTIFIER_CASE": True,
-        },
-    }
-    with snowflake.connector.connect(**server_with_flag, database="db1", schema="schema1") as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 AS my_col, 2 AS another_col")
-        assert [d.name for d in cur.description] == ["my_col", "another_col"]
-
-
 def test_server_put_list(sdcur: snowflake.connector.cursor.DictCursor) -> None:
     dcur = sdcur
 

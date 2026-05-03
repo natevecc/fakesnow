@@ -153,16 +153,15 @@ async def login_request(request: Request) -> JSONResponse:
         fs = FakeSnow(db_path=db_path)
     token = secrets.token_urlsafe(32)
     # Forward the full session_params dict so connection-level fakesnow-specific
-    # toggles (e.g. FAKESNOW_PRESERVE_IDENTIFIER_CASE) reach FakeSnowflakeConnection
-    # without requiring a server.py edit per new opt-in. AUTOCOMMIT and nop_regexes
-    # are also extracted into named kwargs above; the named kwargs win because
-    # FakeSnowflakeConnection reads them from kwargs directly. Other Snowflake-
-    # canonical params in the dict (TIMEZONE, STATEMENT_TIMEOUT_IN_SECONDS, etc.)
-    # are inert -- FakeSnowflakeConnection ignores keys it doesn't know.
-    preserve_id_case = bool(session_params.get("FAKESNOW_PRESERVE_IDENTIFIER_CASE"))
+    # toggles reach FakeSnowflakeConnection without requiring a server.py edit per
+    # new opt-in. AUTOCOMMIT and nop_regexes are also extracted into named kwargs
+    # above; the named kwargs win because FakeSnowflakeConnection reads them from
+    # kwargs directly. Other Snowflake-canonical params in the dict (TIMEZONE,
+    # STATEMENT_TIMEOUT_IN_SECONDS, etc.) are inert -- FakeSnowflakeConnection
+    # ignores keys it doesn't know.
     logger.info(
         f"[LOGIN] database={database} schema={schema} autocommit={autocommit} "
-        f"nop_regexes={nop_regexes} preserve_identifier_case={preserve_id_case}"
+        f"nop_regexes={nop_regexes}"
     )
     sessions[token] = fs.connect(
         database,

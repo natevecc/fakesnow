@@ -42,13 +42,6 @@ if TYPE_CHECKING:
     from fakesnow.conn import FakeSnowflakeConnection
 
 
-def _identity_transform(expression: Expr) -> Expr:
-    """No-op transform used in place of upper_case_unquoted_identifiers when
-    FakeSnowflakeConnection.preserve_identifier_case is True. Defined at module
-    level so we don't allocate a new lambda per execute call."""
-    return expression
-
-
 SCHEMA_UNSET = "schema_unset"
 SQL_SUCCESS = "SELECT 'Statement executed successfully.' as 'status'"
 SQL_CREATED_DATABASE = Template("SELECT 'Database ${name} successfully created.' as 'status'")
@@ -254,18 +247,9 @@ class FakeSnowflakeCursor:
             )
 
     def _transform(self, expression: Expr, params: MutableParams | None) -> Expr:
-        # When the connection opts into preserving identifier case, the
-        # upper_case_unquoted_identifiers transform is replaced by a module-level
-        # no-op so DuckDB's natural (lower) casing reaches the cursor. Otherwise the
-        # default Snowflake-mimicking upper-casing pass runs.
-        identifier_case_transform = (
-            _identity_transform
-            if self._conn.preserve_identifier_case
-            else transforms.upper_case_unquoted_identifiers
-        )
         return (
             expression.transform(lambda e: transforms.identifier(e, params))
-            .transform(identifier_case_transform)
+            .transform(transforms.upper_case_unquoted_identifiers)
             .transform(transforms.alter_session)
             .transform(transforms.update_variables, variables=self._conn.variables)
             .transform(transforms.current_version)
