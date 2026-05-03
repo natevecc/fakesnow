@@ -1,0 +1,14 @@
+services:
+  fakesnow:
+    build: .
+    image: natevecc/fakesnow:dev
+    container_name: fakesnow
+    platform: linux/arm64
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

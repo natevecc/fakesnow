@@ -19,6 +19,42 @@ Or to install with the server:
 pip install fakesnow[server]
 ```
 
+## Running via Docker
+
+A Docker image is published to Docker Hub at `natevecc/fakesnow`.
+
+### Pull and run
+
+```shell
+docker run -p 8000:8000 natevecc/fakesnow
+```
+
+The fakesnow server will accept Snowflake-protocol connections at `http://localhost:8000`. Connect via the snowflake-sdk with `protocol: 'http'`.
+
+### Build locally
+
+```shell
+docker build -t natevecc/fakesnow:dev --platform linux/arm64 .
+docker run -p 8000:8000 --platform linux/arm64 natevecc/fakesnow:dev
+```
+
+### Publish a new version (manual)
+
+After committing changes to the `snowflake-integration-compat` branch:
+
+```shell
+SHA=$(git rev-parse --short HEAD)
+docker build -t natevecc/fakesnow:${SHA} -t natevecc/fakesnow:snowflake-integration-compat --platform linux/arm64 .
+docker push natevecc/fakesnow:${SHA}
+docker push natevecc/fakesnow:snowflake-integration-compat
+```
+
+Currently arm64-only.
+
+### Health check
+
+The container exposes `GET /health` returning `200 {"status": "ok"}` for testcontainers / liveness probes.
+
 ## Usage
 
 fakesnow offers two main approaches for faking Snowflake: [in-process patching](#in-process-patching) of the Snowflake Connector for Python or a [standalone HTTP server](#run-fakesnow-as-a-server).

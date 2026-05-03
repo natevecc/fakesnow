@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+tests
+docs
+.gitignore
+.gitattributes
+README.md
+LICENSE
+CHANGELOG.md

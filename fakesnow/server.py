@@ -449,6 +449,15 @@ async def session(request: Request) -> JSONResponse:
         )
 
 
+async def health(request: Request) -> JSONResponse:
+    try:
+        cur = shared_fs.duck_conn.execute("SELECT 1")
+        cur.fetchone()
+        return SafeJSONResponse({"status": "ok"})
+    except Exception as e:
+        return SafeJSONResponse({"status": "degraded", "error": str(e)[:200]}, status_code=503)
+
+
 def monitoring_query(request: Request) -> JSONResponse:
     try:
         token = to_token(request)
@@ -488,6 +497,7 @@ routes = [
     ),
     Route("/queries/v1/abort-request", lambda _: SafeJSONResponse({"success": True}), methods=["POST"]),
     Route("/monitoring/queries/{sfqid}", monitoring_query, methods=["GET"]),
+    Route("/health", health, methods=["GET"]),
 ]
 
-app = Starlette(debug=True, routes=routes)
+app = Starlette(debug=False, routes=routes)
