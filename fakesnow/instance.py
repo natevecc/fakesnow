@@ -11,6 +11,7 @@ import duckdb
 import fakesnow.fakes as fakes
 import fakesnow.macros as macros
 from fakesnow import info_schema
+from fakesnow.catalog_setup import post_attach_setup
 from fakesnow.transforms import show
 
 logger = logging.getLogger("fakesnow.instance")
@@ -72,8 +73,7 @@ class FakeSnow:
 
             logger.info(f"Attaching existing database: {db_name} from {db_file}")
             self.duck_conn.execute(f"ATTACH DATABASE '{db_file}' AS {db_name}")
-            self.duck_conn.execute(info_schema.per_db_creation_sql(db_name))
-            self.duck_conn.execute(macros.creation_sql(db_name))
+            post_attach_setup(self.duck_conn, db_name)
 
     def connect(
         self,

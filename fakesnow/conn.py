@@ -14,8 +14,7 @@ from snowflake.connector.cursor import DictCursor, SnowflakeCursor
 from sqlglot import exp
 from typing_extensions import Self
 
-import fakesnow.info_schema as info_schema
-import fakesnow.macros as macros
+from fakesnow.catalog_setup import post_attach_setup
 from fakesnow.cursor import FakeSnowflakeCursor
 from fakesnow.variables import Variables
 
@@ -77,8 +76,7 @@ class FakeSnowflakeConnection:
 
             # creates db file if it doesn't exist
             duck_conn.execute(f"ATTACH DATABASE '{db_file}' AS {self.database}")
-            duck_conn.execute(info_schema.per_db_creation_sql(self.database))
-            duck_conn.execute(macros.creation_sql(self.database))
+            post_attach_setup(duck_conn, self.database)
 
         # create schema if needed
         if (

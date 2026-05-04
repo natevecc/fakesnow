@@ -782,6 +782,37 @@ def test_macros_resolve_without_database_selected(_fakesnow: None) -> None:
         assert obj is not None
 
 
+def test_macros_resolve_after_create_database(_fakesnow: None) -> None:
+    """Regression: macros must be installed for catalogs created via SQL
+    `CREATE DATABASE` (which routes through transforms.create_database ->
+    cursor's create_db_name handler), not just for catalogs created when
+    a connection is constructed with database=X. Without per-catalog
+    macros installed at the SQL-CREATE-DATABASE site, a subsequent
+    USE DATABASE switches the active catalog and unqualified _fs_*
+    calls fail with `Catalog Error: Scalar Function with name
+    _fs_to_timestamp does not exist`.
+    """
+    # Connect with no database/schema so the only way the new catalog
+    # gets its macros is via the SQL CREATE DATABASE path.
+    with snowflake.connector.connect() as conn, conn.cursor() as cur:
+        cur.execute("CREATE DATABASE my_test_db")
+        cur.execute("USE DATABASE my_test_db")
+
+        # to_timestamp -> emits _fs_to_timestamp (must resolve in active catalog)
+        cur.execute("SELECT to_timestamp(0)")
+        assert cur.fetchone() is not None
+
+        # FLATTEN -> emits _fs_flatten
+        cur.execute("SELECT * FROM TABLE(FLATTEN(input => parse_json('[1,2,3]')))")
+        rows = cur.fetchall()
+        assert len(rows) == 3
+
+        # OBJECT_CONSTRUCT -> emits _FS_OBJECT_CONSTRUCT
+        cur.execute("SELECT OBJECT_CONSTRUCT('a', 1, 'b', 2)")
+        obj = cur.fetchone()
+        assert obj is not None
+
+
 # Snowflake SQL variables: https://docs.snowflake.com/en/sql-reference/session-variables#using-variables-in-sql
 #
 # Variables are scoped to the session (Eg. The connection, not the cursor)

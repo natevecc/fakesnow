@@ -28,6 +28,7 @@ import fakesnow.expr as expr
 import fakesnow.info_schema as info_schema
 import fakesnow.transforms as transforms
 from fakesnow import logger
+from fakesnow.catalog_setup import post_attach_setup
 from fakesnow.copy_into import copy_into
 from fakesnow.params import MutableParams
 from fakesnow.rowtype import describe_as_result_metadata, describe_as_rowtype
@@ -444,8 +445,9 @@ class FakeSnowflakeCursor:
             self._conn.autocommit(set_autocommit)
 
         elif create_db_name := transformed.args.get("create_db_name"):
-            # we created a new database, so create the info schema extensions
-            self._duck_conn.execute(info_schema.per_db_creation_sql(create_db_name))
+            # we created a new database, so install per-catalog info-schema
+            # views and `_fs_*` macros (must match every other ATTACH site)
+            post_attach_setup(self._duck_conn, create_db_name)
             result_sql = SQL_CREATED_DATABASE.substitute(name=create_db_name)
 
         elif stage_name := transformed.args.get("create_stage_name"):

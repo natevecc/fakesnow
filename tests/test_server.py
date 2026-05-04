@@ -723,11 +723,16 @@ def _login_and_get_token(server: dict, session_parameters: dict | None = None) -
     return body["data"]["token"]
 
 
-def _exec_query(server: dict, token: str, sql: str) -> dict:
+def _exec_query(
+    server: dict, token: str, sql: str, bindings: dict | None = None
+) -> dict:
+    payload: dict = {"sqlText": sql}
+    if bindings is not None:
+        payload["bindings"] = bindings
     resp = requests.post(
         f"http://{server['host']}:{server['port']}/queries/v1/query-request?requestId=node-sdk-test",
         headers={"Authorization": f'Snowflake Token="{token}"'},
-        json={"sqlText": sql},
+        json=payload,
         timeout=5,
     )
     assert resp.status_code == 200, resp.text
@@ -865,4 +870,110 @@ def test_server_node_sdk_cached_result_echoes_bigint_param_and_stringifies(
     # BigInt-flag echo through the cached path.
     params = {p["name"]: p["value"] for p in cached["parameters"]}
     assert params.get("JS_TREAT_INTEGER_AS_BIGINT") is True
+
+
+# --- Node SDK temporal-rowset parity (DATE / TIMESTAMP_NTZ) ------------------
+#
+# Real Snowflake's wire contract for the JSON `data.rowset` payload encodes
+# DATE columns as days-since-epoch numeric strings (e.g. "20089" for
+# 2025-01-01) and TIMESTAMP_NTZ columns as fractional-epoch-seconds strings
+# (e.g. "1735693261.000000000"). The Node SDK's `convertRawDate` /
+# `convertRawTimestampNtz` parse these via `Number(...)` / `BigNumber(...)`.
+# fakesnow used to emit ISO strings ("2025-01-01") which silently coerced to
+# NaN -> epoch zero -> 1970-01-01. The Python SDK is unaffected (it consumes
+# `rowsetBase64`, not `rowset`).
+
+
+def test_server_node_sdk_rowset_bound_date_emitted_as_days_since_epoch(
+    server: dict,
+) -> None:
+    """A DATE bind round-trips to the Snowflake JSON wire format
+    (days-since-epoch as a numeric string), not an ISO date string."""
+    token = _login_and_get_token(server)
+    # Mimic the Node SDK's wire format for a TEXT-typed binding -- the Node
+    # SDK categorizes any string bind as TEXT (see snowflake-sdk
+    # statement.js:buildBindsMap), and slonik's `sql.date(...)` fragment emits
+    # the date in ISO-yyyy-mm-dd form. The downstream SQL casts via `:N::date`.
+    data = _exec_query(
+        server,
+        token,
+        "SELECT :1::date AS d",
+        bindings={"1": {"type": "TEXT", "value": "2025-01-01"}},
+    )
+    assert data["rowtype"][0]["type"] == "date"
+    # 2025-01-01 == day 20089 of the Unix epoch.
+    assert data["rowset"][0][0] == "20089"
+
+
+def test_server_node_sdk_rowset_bound_timestamp_emitted_as_fractional_epoch_seconds(
+    server: dict,
+) -> None:
+    """A TIMESTAMP bind round-trips to the Snowflake JSON wire format
+    (fractional epoch seconds as a numeric string at the column's scale),
+    not an ISO datetime string."""
+    token = _login_and_get_token(server)
+    # Mimic slonik's `sql.timestamp(date)` fragment -- it emits
+    # `to_timestamp(:N)` with the bind value being epoch-seconds-as-string.
+    data = _exec_query(
+        server,
+        token,
+        "SELECT to_timestamp(:1) AS t",
+        bindings={"1": {"type": "TEXT", "value": "1735693261"}},
+    )
+    assert data["rowtype"][0]["type"] == "timestamp_ntz"
+    scale = data["rowtype"][0]["scale"]
+    # fakesnow's default TIMESTAMP_NTZ scale is 9 (nanosecond precision).
+    # Sanity: if scale ever drifts, this test still validates the format.
+    assert scale == 9
+    # 1735693261 == 2025-01-01 01:01:01 UTC.
+    assert data["rowset"][0][0] == "1735693261.000000000"
+
+
+def test_server_node_sdk_rowset_null_date_remains_null(server: dict) -> None:
+    """NULL DATE columns must round-trip as JSON null, not as the string
+    "0" or any other coerced form."""
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, "SELECT CAST(NULL AS DATE) AS d")
+    assert data["rowtype"][0]["type"] == "date"
+    assert data["rowset"][0][0] is None
+
+
+def test_server_node_sdk_rowset_null_timestamp_remains_null(server: dict) -> None:
+    """NULL TIMESTAMP_NTZ columns must round-trip as JSON null."""
+    token = _login_and_get_token(server)
+    data = _exec_query(server, token, "SELECT CAST(NULL AS TIMESTAMP_NTZ) AS t")
+    assert data["rowtype"][0]["type"] == "timestamp_ntz"
+    assert data["rowset"][0][0] is None
+
+
+def test_server_node_sdk_cached_result_normalizes_temporal_rowset(
+    server: dict,
+) -> None:
+    """The temporal-rowset normalization must be symmetric across
+    `query_request` AND `get_cached_query_result`, mirroring the BigInt
+    parity coverage above."""
+    token = _login_and_get_token(server)
+    first = _exec_query(
+        server,
+        token,
+        "SELECT :1::date AS d, to_timestamp(:2) AS t",
+        bindings={
+            "1": {"type": "TEXT", "value": "2025-01-01"},
+            "2": {"type": "TEXT", "value": "1735693261"},
+        },
+    )
+    query_id = first["queryId"]
+
+    resp = requests.get(
+        f"http://{server['host']}:{server['port']}/queries/{query_id}/result",
+        headers={"Authorization": f'Snowflake Token="{token}"'},
+        timeout=5,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"], body
+    cached = body["data"]
+
+    assert cached["rowset"][0][0] == "20089"
+    assert cached["rowset"][0][1] == "1735693261.000000000"
 

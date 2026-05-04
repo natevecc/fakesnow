@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import gzip
 import json
 import logging
@@ -110,6 +111,68 @@ def _stringify_fixed_ints(
         for i in fixed_int_cols:
             if row[i] is not None:
                 row[i] = str(row[i])
+    return rowset_json
+
+
+_EPOCH_DATE = datetime.date(1970, 1, 1)
+
+
+def _normalize_temporal_for_json_rowset(
+    rowset_json: list[list[Any]], rowtype: list[dict[str, Any]]
+) -> list[list[Any]]:
+    """Encode date/time/timestamp columns in `rowset_json` per the Snowflake JSON
+    wire contract used by the Node SDK.
+
+    Without this, the Node SDK's `convertRawDate` / `convertRawTimestampNtz`
+    parse the raw column value via `Number(...)`/`BigNumber(...)`. fakesnow's
+    JSON rowset previously emitted `datetime.date` / `datetime.datetime` which
+    the response serializer rendered as ISO strings (e.g. "2025-01-01"). The
+    Node SDK then coerces the ISO string to NaN, multiplies by 86400 (DATE) or
+    a scale factor (TIMESTAMP), and the resulting NaN epoch silently becomes
+    1970-01-01. (The Python SDK is unaffected; it consumes `rowsetBase64`,
+    not `rowset`.)
+
+    Wire format expected by the Node SDK (see column.js `convertRawDate`,
+    `convertRawTimestampNtz` in snowflake-sdk):
+      - DATE         : days since Unix epoch as a string, e.g. "20089"
+      - TIMESTAMP_NTZ: fractional epoch seconds as a string with `scale`
+                       digits of fractional precision, e.g.
+                       "1735693261.000000000" (scale=9). This matches the
+                       format real Snowflake emits.
+
+    Other temporal types (TIME, TIMESTAMP_LTZ, TIMESTAMP_TZ) are not produced
+    by the failing test path and are intentionally left to a follow-up.
+    """
+    temporal_cols = [
+        (i, c.get("type"), c.get("scale") or 0)
+        for i, c in enumerate(rowtype)
+        if c.get("type") in ("date", "timestamp_ntz")
+    ]
+    if not temporal_cols:
+        return rowset_json
+    for row in rowset_json:
+        for i, sf_type, scale in temporal_cols:
+            value = row[i]
+            if value is None:
+                continue
+            if sf_type == "date" and isinstance(value, datetime.date):
+                row[i] = str((value - _EPOCH_DATE).days)
+            elif sf_type == "timestamp_ntz" and isinstance(value, datetime.datetime):
+                # Use a naive datetime as epoch reference -- arrow_table.to_pylist()
+                # yields naive datetimes for TIMESTAMP_NTZ.
+                delta = value - datetime.datetime(1970, 1, 1)
+                seconds = delta.days * 86400 + delta.seconds
+                micros = delta.microseconds
+                # Format as fractional seconds with `scale` digits of precision.
+                # scale=9 (default for fakesnow) means nanosecond precision; we
+                # only have microsecond precision from Python datetime, so the
+                # last 3 digits are always 0.
+                if scale == 0:
+                    row[i] = str(seconds)
+                else:
+                    # Right-pad microseconds to `scale` digits.
+                    frac = f"{micros:06d}".ljust(scale, "0")[:scale]
+                    row[i] = f"{seconds}.{frac}"
     return rowset_json
 
 
@@ -267,6 +330,9 @@ async def query_request(request: Request) -> JSONResponse:
             # Stringify scale-0 fixed numerics so the Node SDK can call
             # bigInt(rawColumnValue) without losing precision past 2^53.
             rowset_json = _stringify_fixed_ints(rowset_json, rowtype)
+            # Encode date/timestamp values as numeric strings the Node SDK's
+            # convertRawDate/convertRawTimestampNtz expect (see helper docstring).
+            rowset_json = _normalize_temporal_for_json_rowset(rowset_json, rowtype)
             logger.debug(f"[QUERY_REQUEST] Arrow table: {len(rowset_json)} rows, rowset_b64 length={len(rowset_b64)}")
         else:
             rowset_b64 = ""
@@ -356,6 +422,9 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
             # Stringify scale-0 fixed numerics for the Node SDK BigInt path
             # (mirrors the fresh-query path in `query_request`).
             rowset_json = _stringify_fixed_ints(rowset_json, rowtype)
+            # Encode date/timestamp values for the Node SDK
+            # (mirrors the fresh-query path in `query_request`).
+            rowset_json = _normalize_temporal_for_json_rowset(rowset_json, rowtype)
         else:
             rowtype = []
             rowset_b64 = ""
