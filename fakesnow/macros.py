@@ -74,3 +74,20 @@ def creation_sql(catalog: str) -> str:
         {FS_OBJECT_CONSTRUCT.substitute(catalog=catalog)};
         {FS_TO_TIMESTAMP.substitute(catalog=catalog)};
     """
+
+
+def global_creation_sql() -> str:
+    """Install macros in the default `memory.main` schema so unqualified calls
+    resolve in sessions that never selected a database.
+
+    DuckDB's function lookup always includes the default catalog's `main`
+    schema; placing the macros there makes them globally discoverable.
+    The per-catalog versions (see `creation_sql`) remain for sessions that
+    explicitly select a catalog — DuckDB resolves to the active catalog's
+    copy first.
+    """
+    return f"""
+        {FS_FLATTEN.substitute(catalog="memory")};
+        {FS_OBJECT_CONSTRUCT.substitute(catalog="memory")};
+        {FS_TO_TIMESTAMP.substitute(catalog="memory")};
+    """

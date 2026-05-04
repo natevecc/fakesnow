@@ -39,6 +39,9 @@ class FakeSnow:
         # create the info schema extensions and show views
         self.duck_conn.execute(info_schema.fs_global_creation_sql())
         self.duck_conn.execute(show.fs_global_creation_sql())
+        # install fakesnow macros in the default `memory.main` schema so unqualified
+        # calls (emitted by transforms) resolve in sessions with no database selected
+        self.duck_conn.execute(macros.global_creation_sql())
 
         # use UTC instead of local time zone for consistent testing
         self.duck_conn.execute("SET GLOBAL TimeZone = 'UTC'")

@@ -755,6 +755,33 @@ def test_use_invalid_schema(_fakesnow: None):
         )
 
 
+def test_macros_resolve_without_database_selected(_fakesnow: None) -> None:
+    """Regression: macros must be resolvable in sessions that never selected
+    a database. The fix installs them in memory.main alongside the per-catalog
+    versions so unqualified _fs_to_timestamp / _fs_flatten / _fs_object_construct
+    calls (emitted by transforms) resolve when no catalog is active.
+    """
+    # Connect with no database/schema
+    with snowflake.connector.connect() as conn, conn.cursor() as cur:
+        # to_timestamp via UnixToTime path -> emits _fs_to_timestamp
+        cur.execute("SELECT to_timestamp(0)")
+        assert cur.fetchone() is not None
+
+        # to_timestamp via CAST path -> also routed through _fs_to_timestamp
+        cur.execute("SELECT CAST('2025-01-01' AS TIMESTAMP)")
+        assert cur.fetchone() is not None
+
+        # FLATTEN -> emits _fs_flatten
+        cur.execute("SELECT * FROM TABLE(FLATTEN(input => parse_json('[1,2,3]')))")
+        rows = cur.fetchall()
+        assert len(rows) == 3
+
+        # OBJECT_CONSTRUCT -> emits _FS_OBJECT_CONSTRUCT
+        cur.execute("SELECT OBJECT_CONSTRUCT('a', 1, 'b', 2)")
+        obj = cur.fetchone()
+        assert obj is not None
+
+
 # Snowflake SQL variables: https://docs.snowflake.com/en/sql-reference/session-variables#using-variables-in-sql
 #
 # Variables are scoped to the session (Eg. The connection, not the cursor)
