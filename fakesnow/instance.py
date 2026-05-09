@@ -3,6 +3,20 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
+
+
+class _CappedResultsCache(OrderedDict):
+    """Drops oldest entries on insert to keep the cache bounded across
+    long-running test sessions. fakesnow's default cache has no eviction."""
+
+    _MAX = 50
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        while len(self) > self._MAX:
+            self.popitem(last=False)
+
+
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +46,7 @@ class FakeSnow:
         self.db_path = db_path
         self.nop_regexes = nop_regexes
 
-        self.results_cache: OrderedDict[str, tuple] = OrderedDict()
+        self.results_cache: OrderedDict[str, tuple] = _CappedResultsCache()
         self.duck_conn = duckdb.connect(database=":memory:")
 
         # create a "global" database for storing objects which span databases.
