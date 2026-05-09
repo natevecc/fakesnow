@@ -37,6 +37,41 @@ def alias_in_join(expression: Expr) -> Expr:
     return expression
 
 
+def arrays_overlap_json_cast(expression: Expr) -> Expr:
+    """Cast both sides of `ARRAYS_OVERLAP(a, b)` to `VARCHAR[]`.
+
+    fakesnow's stack translates Snowflake `ARRAYS_OVERLAP` to DuckDB's `&&`
+    operator, which requires `(T[], T[])`. JSON-typed columns (PARSE_JSON
+    stored values) and untyped array literals trip a `&&(JSON, ...[])`
+    binder error. Casting both operands to `VARCHAR[]` works for JSON,
+    INTEGER[], VARCHAR[], and BIGINT[] sources (DuckDB up-casts elements),
+    while preserving NULL elements as NULL.
+    """
+    if isinstance(expression, exp.ArrayOverlaps):
+        varchar_array = exp.DataType(
+            this=exp.DataType.Type.ARRAY,
+            expressions=[exp.DataType(this=exp.DataType.Type.VARCHAR)],
+            nested=True,
+        )
+        # Skip if already wrapped (defensive — transform may run twice)
+        left = expression.this
+        right = expression.expression
+        already_cast = lambda e: (
+            isinstance(e, exp.Cast)
+            and isinstance(e.to, exp.DataType)
+            and e.to.this == exp.DataType.Type.ARRAY
+        )
+        if already_cast(left) and already_cast(right):
+            return expression
+        new_left = left if already_cast(left) else exp.Cast(this=left.copy(), to=varchar_array.copy())
+        new_right = right if already_cast(right) else exp.Cast(this=right.copy(), to=varchar_array.copy())
+        kwargs = {"this": new_left, "expression": new_right}
+        if expression.args.get("null_safe"):
+            kwargs["null_safe"] = True
+        return exp.ArrayOverlaps(**kwargs)
+    return expression
+
+
 def array_construct_etc(expression: Expr) -> Expr:
     """Handle ARRAY_CONSTRUCT_* and ARRAY_CAT
 
