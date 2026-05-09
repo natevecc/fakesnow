@@ -43,7 +43,8 @@ class SafeJSONResponse(JSONResponse):
         return json.dumps(content, default=str).encode("utf-8")
 
 logger.info(f"Creating shared in-memory database for session")
-shared_fs = FakeSnow()
+_shared_db_path = os.environ.get("FAKESNOW_SHARED_DB_PATH")
+shared_fs = FakeSnow(db_path=_shared_db_path) if _shared_db_path else FakeSnow()
 sessions: dict[str, FakeSnowflakeConnection] = {}
 # Per-session SDK-driver toggles captured at login for Node SDK BigInt
 # normalization. The Node SDK selects `convertRawBigInt` only when
