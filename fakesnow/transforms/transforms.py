@@ -1742,8 +1742,10 @@ def numeric_agg_implicit_cast(expression: Expr) -> Expr:
     if isinstance(expression, _NUMERIC_ONLY_AGGS):
         arg = expression.this
         col_name = None if isinstance(expression.parent, exp.Alias) else _numeric_agg_col_name(expression, arg)
-        # Don't double-cast if already cast
-        if not isinstance(arg, (exp.Cast, exp.TryCast)):
+        # Don't double-cast if already cast, and don't silently demote
+        # integer column types to DOUBLE (breaks Snowflake-compatible SUM(BIGINT)
+        # -> NUMBER(38,0) wire output the Node SDK expects).
+        if not isinstance(arg, (exp.Cast, exp.TryCast, exp.Column)):
             expression.set(
                 "this",
                 exp.TryCast(this=arg, to=exp.DataType(this=exp.DataType.Type.DOUBLE)),
