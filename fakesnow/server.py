@@ -118,6 +118,28 @@ def _stringify_fixed_ints(
 _EPOCH_DATE = datetime.date(1970, 1, 1)
 
 
+def _stringify_booleans(
+    rowset_json: list[list[Any]], rowtype: list[dict[str, Any]]
+) -> list[list[Any]]:
+    """Encode boolean columns as "TRUE"/"FALSE" strings per the Snowflake JSON
+    wire contract used by the Node SDK (see column.js convertRawBoolean).
+
+    Without this, the Node SDK trips on native JS `false` values: the third
+    branch of its boolean test calls `.toUpperCase()` on the raw value, which
+    is fine for strings but throws TypeError for booleans.
+    """
+    bool_cols = [i for i, c in enumerate(rowtype) if c.get("type") == "boolean"]
+    if not bool_cols:
+        return rowset_json
+    for row in rowset_json:
+        for i in bool_cols:
+            value = row[i]
+            if value is None:
+                continue
+            row[i] = "TRUE" if value else "FALSE"
+    return rowset_json
+
+
 def _normalize_temporal_for_json_rowset(
     rowset_json: list[list[Any]], rowtype: list[dict[str, Any]]
 ) -> list[list[Any]]:
@@ -334,6 +356,7 @@ async def query_request(request: Request) -> JSONResponse:
             # Encode date/timestamp values as numeric strings the Node SDK's
             # convertRawDate/convertRawTimestampNtz expect (see helper docstring).
             rowset_json = _normalize_temporal_for_json_rowset(rowset_json, rowtype)
+            rowset_json = _stringify_booleans(rowset_json, rowtype)
             logger.debug(f"[QUERY_REQUEST] Arrow table: {len(rowset_json)} rows, rowset_b64 length={len(rowset_b64)}")
         else:
             rowset_b64 = ""
@@ -426,6 +449,7 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
             # Encode date/timestamp values for the Node SDK
             # (mirrors the fresh-query path in `query_request`).
             rowset_json = _normalize_temporal_for_json_rowset(rowset_json, rowtype)
+            rowset_json = _stringify_booleans(rowset_json, rowtype)
         else:
             rowtype = []
             rowset_b64 = ""
