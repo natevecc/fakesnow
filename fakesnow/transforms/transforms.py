@@ -37,6 +37,63 @@ def alias_in_join(expression: Expr) -> Expr:
     return expression
 
 
+def arrays_overlap_strict(expression: Expr) -> Expr:
+    """Rewrite Snowflake `ARRAYS_OVERLAP(a, b)` to match real Snowflake VARIANT semantics.
+
+    Snowflake's VARIANT stores both the value AND the runtime type — element
+    equality is strict (no implicit string<->number coercion) and NULL-safe
+    (NULL element matches NULL element). DuckDB's native `&&` operator is
+    permissive on types and requires a `(T[], T[])` operand shape, which
+    JSON-typed columns from PARSE_JSON trip with a binder error.
+
+    The rewrite emits:
+
+        CASE
+          WHEN <a> IS NULL OR <b> IS NULL THEN NULL
+          ELSE EXISTS (
+            SELECT 1
+            FROM unnest(CAST(to_json(<a>) AS JSON[])) AS _ao_l(e1),
+                 unnest(CAST(to_json(<b>) AS JSON[])) AS _ao_r(e2)
+            WHERE e1 IS NOT DISTINCT FROM e2
+          )
+        END
+
+    `to_json` is the normalizer: it serializes each operand — whether a JSON
+    scalar from `PARSE_JSON('[...]')` or a typed array literal from
+    `ARRAY_CONSTRUCT(...)` — into a JSON array text. Casting that text to
+    `JSON[]` then re-parses each element preserving its type (string vs.
+    number etc.). A bare `CAST(['20000'] AS JSON[])` instead re-parses the
+    VARCHAR `'20000'` as JSON, mis-typing it as a JSON number and breaking
+    strict comparison against a VARIANT-string LHS — `to_json` avoids that
+    by quoting strings as JSON-strings before the JSON[] re-parse.
+
+    DuckDB JSON equality is strict (`JSON('"123"') = JSON('123')` -> FALSE),
+    and `IS NOT DISTINCT FROM` is NULL-safe (`JSON('null')` matches itself).
+    The CASE wrapper preserves Snowflake's NULL-argument-returns-NULL contract.
+    """
+    if not isinstance(expression, exp.ArrayOverlaps):
+        return expression
+
+    left_sql = expression.this.sql(dialect="duckdb")
+    right_sql = expression.expression.sql(dialect="duckdb")
+
+    rewritten = sqlglot.parse_one(
+        f"""
+        CASE
+          WHEN ({left_sql}) IS NULL OR ({right_sql}) IS NULL THEN NULL
+          ELSE EXISTS (
+            SELECT 1
+            FROM unnest(CAST(to_json({left_sql}) AS JSON[])) AS _ao_l(e1),
+                 unnest(CAST(to_json({right_sql}) AS JSON[])) AS _ao_r(e2)
+            WHERE e1 IS NOT DISTINCT FROM e2
+          )
+        END
+        """,
+        dialect="duckdb",
+    )
+    return rewritten
+
+
 def array_construct_etc(expression: Expr) -> Expr:
     """Handle ARRAY_CONSTRUCT_* and ARRAY_CAT
 
