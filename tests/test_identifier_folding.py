@@ -92,3 +92,26 @@ def test_column_folding_mismatch_raises(sql: str) -> None:
 )
 def test_genuine_unknown_columns_fall_through(sql: str) -> None:
     _check(sql)  # no raise; left for DuckDB to handle
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE foo (id INT)",
+        "INSERT INTO foo VALUES (1)",
+        "SET my_var = 1",
+    ],
+)
+def test_non_select_statements_skipped(sql: str) -> None:
+    _check(sql)  # no analysis, no raise
+
+
+def test_ignore_case_flag_skips_checks() -> None:
+    sql = 'WITH ts AS (SELECT 1 AS a) SELECT * FROM "ts"'  # mismatched quoting; would raise without the flag
+    identifier_folding.check_folding(
+        parse_one(sql, read="snowflake"), quoted_identifiers_ignore_case=True
+    )  # no raise
+
+
+def test_simple_select_does_not_raise() -> None:
+    _check("SELECT 1")  # nothing to resolve; must not raise from the checker

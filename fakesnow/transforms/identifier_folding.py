@@ -49,6 +49,10 @@ def check_folding(
     if quoted_identifiers_ignore_case:
         return
     try:
+        # Only statements that resolve identifiers (contain a SELECT) can have a
+        # folding mismatch; skip DDL/DML/session statements cheaply.
+        if expression.find(exp.Select) is None:
+            return
         ast = expression.copy()
         normalize_identifiers(ast, dialect="snowflake")
         _check_table_folding(ast)
