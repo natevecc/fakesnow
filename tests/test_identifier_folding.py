@@ -109,9 +109,7 @@ def test_non_select_statements_skipped(sql: str) -> None:
 
 def test_ignore_case_flag_skips_checks() -> None:
     sql = 'WITH ts AS (SELECT 1 AS a) SELECT * FROM "ts"'  # mismatched quoting; would raise without the flag
-    identifier_folding.check_folding(
-        parse_one(sql, read="snowflake"), quoted_identifiers_ignore_case=True
-    )  # no raise
+    identifier_folding.check_folding(parse_one(sql, read="snowflake"), quoted_identifiers_ignore_case=True)  # no raise
 
 
 def test_simple_select_does_not_raise() -> None:

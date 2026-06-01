@@ -27,13 +27,12 @@ import fakesnow.checks as checks
 import fakesnow.expr as expr
 import fakesnow.info_schema as info_schema
 import fakesnow.transforms as transforms
-from fakesnow.transforms import identifier_folding
 from fakesnow import logger
 from fakesnow.catalog_setup import post_attach_setup
 from fakesnow.copy_into import copy_into
 from fakesnow.params import MutableParams
 from fakesnow.rowtype import describe_as_result_metadata, describe_as_rowtype
-from fakesnow.transforms import stage
+from fakesnow.transforms import identifier_folding, stage
 
 if TYPE_CHECKING:
     # don't require pandas at import time

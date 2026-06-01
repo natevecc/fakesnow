@@ -22,7 +22,7 @@ import logging
 import re
 
 import snowflake.connector.errors
-from sqlglot import exp
+from sqlglot import Expr, exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify import qualify
@@ -36,7 +36,7 @@ _UNRESOLVED_COLUMN = re.compile(r"Column '([^']+)' could not be resolved|Unknown
 
 
 def check_folding(
-    expression: exp.Expression,
+    expression: Expr,
     *,
     quoted_identifiers_ignore_case: bool = False,
 ) -> None:
@@ -63,7 +63,7 @@ def check_folding(
         logger.debug("identifier-folding check skipped: %s", e)
 
 
-def _check_table_folding(ast: exp.Expression) -> None:
+def _check_table_folding(ast: Expr) -> None:
     """Detection 1: a bare (unqualified) table reference collides with an
     in-scope CTE name case-insensitively but not exactly. CTEs are the only
     construct referenced by bare name, so the check keys strictly off CTE names;
@@ -85,7 +85,7 @@ def _check_table_folding(ast: exp.Expression) -> None:
                     _raise_object_not_found(ref)
 
 
-def _check_column_folding(ast: exp.Expression) -> None:
+def _check_column_folding(ast: Expr) -> None:
     """Detection 2: qualify reports an unresolved column that collides with an
     available column on a known source case-insensitively but not exactly."""
     try:
@@ -101,7 +101,7 @@ def _check_column_folding(ast: exp.Expression) -> None:
                     _raise_invalid_identifier(missing)
 
 
-def _available_columns(ast: exp.Expression) -> dict[str, set[str]]:
+def _available_columns(ast: Expr) -> dict[str, set[str]]:
     """Columns exposed by each non-base-table source (CTE/derived), keyed by source name.
     Base tables are skipped: their columns are unknown, so qualify treats them as permissive
     and a missing column there is not a folding collision."""
@@ -113,9 +113,7 @@ def _available_columns(ast: exp.Expression) -> dict[str, set[str]]:
             inner = getattr(source, "expression", None)
             if isinstance(inner, exp.Select):
                 # skip unnamed projections (e.g. SELECT *), whose alias_or_name is empty
-                columns.setdefault(name, set()).update(
-                    p.alias_or_name for p in inner.selects if p.alias_or_name
-                )
+                columns.setdefault(name, set()).update(p.alias_or_name for p in inner.selects if p.alias_or_name)
     return columns
 
 
