@@ -167,3 +167,16 @@ def test_snowflake_constructs_pass(sql: str) -> None:
 def test_canonical_regressions_raise(sql: str) -> None:
     with pytest.raises(snowflake.connector.errors.ProgrammingError):
         _check(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # genuine missing column (DuckDB errors too); a sibling CTE's quoted column must
+        # not contaminate the check for a reference targeting a different source
+        'WITH t1 AS (SELECT 1 AS "period"), t2 AS (SELECT 2 AS x) SELECT t2.PERIOD FROM t2',
+        'WITH t1 AS (SELECT 1 AS "period"), t2 AS (SELECT 2 AS x) SELECT period FROM t2',
+    ],
+)
+def test_column_no_false_positive_across_sources(sql: str) -> None:
+    _check(sql)  # no raise; the missing column is genuinely absent from the referenced source

@@ -86,35 +86,23 @@ def _check_table_folding(ast: Expr) -> None:
 
 
 def _check_column_folding(ast: Expr) -> None:
-    """Detection 2: qualify reports an unresolved column that collides with an
-    available column on a known source case-insensitively but not exactly."""
+    """Detection 2: a column reference Snowflake (case-sensitive) cannot resolve but
+    DuckDB (case-insensitive) can --- a quoted/unquoted folding mismatch DuckDB would
+    silently run. If Snowflake resolves it there is no mismatch; if both engines reject
+    it the column is genuinely missing; either way, fall through."""
     try:
         qualify(ast.copy(), dialect="snowflake", validate_qualify_columns=True)
+        return  # Snowflake resolves it -> no mismatch
     except OptimizeError as e:
         match = _UNRESOLVED_COLUMN.search(str(e))
         if not match:
-            return  # not a column-resolution failure; leave to DuckDB
+            return  # failed for a non-column reason -> leave to DuckDB
         missing = match.group(1) or match.group(2)
-        for columns in _available_columns(ast).values():
-            for column in columns:
-                if missing != column and missing.lower() == column.lower():
-                    _raise_invalid_identifier(missing)
-
-
-def _available_columns(ast: Expr) -> dict[str, set[str]]:
-    """Columns exposed by each non-base-table source (CTE/derived), keyed by source name.
-    Base tables are skipped: their columns are unknown, so qualify treats them as permissive
-    and a missing column there is not a folding collision."""
-    columns: dict[str, set[str]] = {}
-    for scope in traverse_scope(ast):
-        for name, source in scope.sources.items():
-            if isinstance(source, exp.Table):
-                continue
-            inner = getattr(source, "expression", None)
-            if isinstance(inner, exp.Select):
-                # skip unnamed projections (e.g. SELECT *), whose alias_or_name is empty
-                columns.setdefault(name, set()).update(p.alias_or_name for p in inner.selects if p.alias_or_name)
-    return columns
+    try:
+        qualify(ast.copy(), dialect="duckdb", validate_qualify_columns=True)
+    except OptimizeError:
+        return  # DuckDB also rejects -> genuine missing column -> fall through
+    _raise_invalid_identifier(missing)
 
 
 def _raise_object_not_found(ref: str) -> None:
