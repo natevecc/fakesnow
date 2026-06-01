@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import snowflake.connector.cursor
 import snowflake.connector.errors
 from sqlglot import parse_one
 
@@ -115,3 +116,20 @@ def test_ignore_case_flag_skips_checks() -> None:
 
 def test_simple_select_does_not_raise() -> None:
     _check("SELECT 1")  # nothing to resolve; must not raise from the checker
+
+
+def test_table_folding_raises_through_cursor(cur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        cur.execute('WITH ts AS (SELECT 1 AS a) SELECT * FROM "ts"')
+    assert cur.sqlstate == "42S02"
+
+
+def test_column_folding_raises_through_cursor(cur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        cur.execute('WITH t AS (SELECT 1 AS period) SELECT "period" FROM t')
+    assert cur.sqlstate == "42000"
+
+
+def test_consistent_query_returns_rows(cur: snowflake.connector.cursor.SnowflakeCursor) -> None:
+    cur.execute("WITH ts AS (SELECT 1 AS a) SELECT a FROM ts")
+    assert cur.fetchall() == [(1,)]

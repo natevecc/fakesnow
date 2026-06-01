@@ -27,6 +27,7 @@ import fakesnow.checks as checks
 import fakesnow.expr as expr
 import fakesnow.info_schema as info_schema
 import fakesnow.transforms as transforms
+from fakesnow.transforms import identifier_folding
 from fakesnow import logger
 from fakesnow.catalog_setup import post_attach_setup
 from fakesnow.copy_into import copy_into
@@ -178,6 +179,7 @@ class FakeSnowflakeCursor:
             self.check_db_and_schema(expression)
 
             for exp in self._transform_explode(expression):
+                identifier_folding.check_folding(exp)
                 transformed = self._transform(exp, params)
                 self._execute(transformed, params)
 
