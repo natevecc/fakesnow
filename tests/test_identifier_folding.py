@@ -133,3 +133,39 @@ def test_column_folding_raises_through_cursor(cur: snowflake.connector.cursor.Sn
 def test_consistent_query_returns_rows(cur: snowflake.connector.cursor.SnowflakeCursor) -> None:
     cur.execute("WITH ts AS (SELECT 1 AS a) SELECT a FROM ts")
     assert cur.fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # information_schema folds to uppercase and resolves
+        "SELECT table_name FROM information_schema.tables",
+        # qualified base-table name; unknown columns on unknown schema stay permissive
+        'SELECT "PHRASE_ENCOUNTER_V2"."col" FROM "DEVCLIENT"."GOLD"."PHRASE_ENCOUNTER_V2"',
+        # window / qualify construct over a CTE, consistent quoting
+        "WITH t AS (SELECT 1 AS id, 2 AS n) "
+        "SELECT id, n FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY n) = 1",
+        # multi-CTE join, all unquoted (the consistent numerator shape)
+        "WITH denom AS (SELECT 1 AS period, 10 AS cnt), "
+        "num AS (SELECT 1 AS period, 3 AS event_encounter_count) "
+        "SELECT d.period, n.event_encounter_count FROM denom d JOIN num n ON d.period = n.period",
+    ],
+)
+def test_snowflake_constructs_pass(sql: str) -> None:
+    _check(sql)  # no false positive
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # canonical CTE mismatch, both directions
+        'WITH time_series AS (SELECT 1 AS d) SELECT * FROM "time_series"',
+        'WITH "time_series" AS (SELECT 1 AS d) SELECT * FROM time_series',
+        # numerator cross-fragment alias mismatch (the real motivating case)
+        'WITH num AS (SELECT 1 AS "period", 3 AS event_encounter_count) '
+        "SELECT num.period, num.event_encounter_count FROM num",
+    ],
+)
+def test_canonical_regressions_raise(sql: str) -> None:
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        _check(sql)
