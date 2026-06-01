@@ -593,7 +593,7 @@ def test_server_cache_eviction(sconn: snowflake.connector.SnowflakeConnection) -
     # Verify first query is evicted from cache
     with pytest.raises(
         snowflake.connector.errors.ProgrammingError,
-        match="Statement.*not found|Cannot retrieve data on the status of this query",
+        match=r"Statement.*not found|Cannot retrieve data on the status of this query",
     ):
         cur.execute(f"SELECT * FROM TABLE(RESULT_SCAN('{query_ids[0]}'))")
 

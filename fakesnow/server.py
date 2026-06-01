@@ -42,7 +42,7 @@ class SafeJSONResponse(JSONResponse):
     def render(self, content: Any) -> bytes:
         return json.dumps(content, default=str).encode("utf-8")
 
-logger.info(f"Creating shared in-memory database for session")
+logger.info("Creating shared in-memory database for session")
 _shared_db_path = os.environ.get("FAKESNOW_SHARED_DB_PATH")
 shared_fs = FakeSnow(db_path=_shared_db_path) if _shared_db_path else FakeSnow()
 sessions: dict[str, FakeSnowflakeConnection] = {}
@@ -223,14 +223,14 @@ async def login_request(request: Request) -> JSONResponse:
     if db_path is None:
         # Use the shared in-memory database. This is shared across all sessions and is cleared when the server restarts.
         # Useful for sharing data between sessions without needing to manage database files.
-        logger.info(f"Using shared in-memory database for session")
+        logger.info("Using shared in-memory database for session")
         fs = shared_fs
     elif db_path == ":isolated:":
         # Explicitly setting FAKESNOW_DB_PATH = ":isolated:", creates a new isolated database in memory for every login.
         # Connection close is triggered by the context manager when hitting FakeSnowflakeConnection.__exit__()
         # If used outside of a context manager, users will need to manually close the connection when they're done with
         # it to release resources.
-        logger.info(f"Using isolated in-memory database for session")
+        logger.info("Using isolated in-memory database for session")
         fs = FakeSnow()
     else:
         # Use the set value for db_path. This instructs fakesnow to persist databases to the filesystem, making it
@@ -307,14 +307,14 @@ async def query_request(request: Request) -> JSONResponse:
             logger.debug(f"[QUERY_REQUEST] Executing SQL with params={params}")
             cur = await run_in_threadpool(conn.cursor().execute, sql_text, binding_params=params, server=True)
             logger.info(f"[QUERY_REQUEST] SQL execution completed, queryId={cur.sfqid}, rowcount={cur._rowcount}")  # noqa: SLF001
-            
+
             rowtype = describe_as_rowtype(cur._describe_last_sql())  # noqa: SLF001
 
             expr = cur._last_transformed  # noqa: SLF001
             assert expr
             if put_stage_data := expr.args.get("put_stage_data"):
                 # this is a PUT command, so return the stage data
-                logger.info(f"[QUERY_REQUEST] PUT command detected, returning stage data")
+                logger.info("[QUERY_REQUEST] PUT command detected, returning stage data")
                 return SafeJSONResponse(
                     {
                         "data": put_stage_data,
@@ -361,7 +361,7 @@ async def query_request(request: Request) -> JSONResponse:
         else:
             rowset_b64 = ""
             rowset_json = []
-            logger.debug(f"[QUERY_REQUEST] No arrow table, empty result")
+            logger.debug("[QUERY_REQUEST] No arrow table, empty result")
 
         # Cache the result data (limit to 50 most recent)
         cache_data = {
@@ -378,7 +378,7 @@ async def query_request(request: Request) -> JSONResponse:
             "finalDatabaseName": conn.database,
             "finalSchemaName": conn.schema,
         }
-        
+
         # Store in cache, maintaining max 50 entries (LRU)
         # Store internal tuple format expected by result_scan() and get_results_from_sfqid()
         sfqid = cur.sfqid
@@ -416,18 +416,18 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
     try:
         token = to_token(request)
         conn = to_conn(token)
-        
+
         # Extract query_id from path: /queries/{query_id}/result
         query_id = request.path_params.get("query_id")
         request_guid = request.query_params.get("request_guid", "unknown")
         disable_offline_chunks = request.query_params.get("disableOfflineChunks", "unknown")
-        
+
         logger.info(f"[GET_RESULT] START query_id={query_id} request_guid={request_guid} disableOfflineChunks={disable_offline_chunks} client={request.client.host if request.client else 'unknown'}")
-        
+
         if not query_id:
-            logger.error(f"[GET_RESULT] Missing query_id in request path")
+            logger.error("[GET_RESULT] Missing query_id in request path")
             raise ServerError(status_code=400, code="002003", message="Missing query_id in request path")
-        
+
         # Retrieve from cache
         cached_tuple = conn.results_cache.get(query_id)
 
@@ -484,7 +484,7 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
         }
         logger.debug(f"[GET_RESULT] END query_id={query_id} status=success code=0 rows={rowset_count}")
         return SafeJSONResponse(response)
-        
+
     except ServerError as e:
         logger.error(f"[GET_RESULT] ServerError: code={e.code} message={e.message}")
         return SafeJSONResponse(
@@ -495,11 +495,11 @@ async def get_cached_query_result(request: Request) -> JSONResponse:
 
 def to_token(request: Request) -> str:
     if not (auth := request.headers.get("Authorization")):
-        logger.error(f"[AUTH] Authorization header not found")
+        logger.error("[AUTH] Authorization header not found")
         raise ServerError(status_code=401, code="390101", message="Authorization header not found in the request data.")
 
     token = auth[17:-1]
-    logger.debug(f"[AUTH] Token extracted from Authorization header")
+    logger.debug("[AUTH] Token extracted from Authorization header")
     return token
 
 
@@ -518,7 +518,7 @@ async def session(request: Request) -> JSONResponse:
         _ = to_conn(token)
 
         if bool(request.query_params.get("delete")):
-            logger.info(f"[SESSION] DELETE session")
+            logger.info("[SESSION] DELETE session")
             try:
                 sessions[token]._duck_conn.close()  # Close the duckdb connection to release resources
             finally:
@@ -528,7 +528,7 @@ async def session(request: Request) -> JSONResponse:
                 # we don't leak per-token state across the server lifetime.
                 _session_params_by_token.pop(token, None)
         else:
-            logger.debug(f"[SESSION] HEARTBEAT")
+            logger.debug("[SESSION] HEARTBEAT")
 
         return SafeJSONResponse(
             {"data": None, "code": None, "message": None, "success": True},

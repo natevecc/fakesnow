@@ -84,7 +84,7 @@ class FakeSnowflakeCursor:
         self._use_dict_result = use_dict_result
         self._last_sql: str | None = None
         self._last_params: MutableParams | None = None
-        self._last_transformed: exp.Expression | None = None
+        self._last_transformed: Expr | None = None
         self._sqlstate: str | None = None
         self._arraysize = 1
         self._arrow_table: pyarrow.Table | None = None
@@ -215,7 +215,8 @@ class FakeSnowflakeCursor:
                     "Cannot retrieve data on the status of this query. "
                     "No information returned from server for query '{}'"
                 )
-            # Restore the cached result data (6-tuple: arrow_table, rowcount, last_sql, last_params, last_transformed, rowtype)
+            # Restore the cached result data
+            # (6-tuple: arrow_table, rowcount, last_sql, last_params, last_transformed, rowtype)
             self._arrow_table, self._rowcount, self._last_sql, self._last_params, self._last_transformed, _ = value
             self._sfqid = sfqid
             self._arrow_table_fetch_index = None
@@ -364,7 +365,8 @@ class FakeSnowflakeCursor:
                 raise snowflake.connector.errors.ProgrammingError(
                     msg=f"Statement {sfqid} not found", errno=709, sqlstate="02000"
                 )
-            # Restore the cached result data (6-tuple: arrow_table, rowcount, last_sql, last_params, last_transformed, rowtype)
+            # Restore the cached result data
+            # (6-tuple: arrow_table, rowcount, last_sql, last_params, last_transformed, rowtype)
             self._arrow_table, self._rowcount, self._last_sql, self._last_params, self._last_transformed, _ = value
             self._sfqid = sfqid
             self._arrow_table_fetch_index = None
