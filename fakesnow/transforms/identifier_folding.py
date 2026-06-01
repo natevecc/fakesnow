@@ -19,13 +19,20 @@ through to DuckDB, which raises its own not-found error.
 from __future__ import annotations
 
 import logging
+import re
 
 import snowflake.connector.errors
 from sqlglot import exp
+from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import traverse_scope
 
 logger = logging.getLogger(__name__)
+
+# qualify reports an unresolved column two ways: unqualified refs as
+# "Column 'X' could not be resolved", qualified refs (a.b) as "Unknown column: X".
+_UNRESOLVED_COLUMN = re.compile(r"Column '([^']+)' could not be resolved|Unknown column: (\S+)")
 
 
 def check_folding(
@@ -45,6 +52,7 @@ def check_folding(
         ast = expression.copy()
         normalize_identifiers(ast, dialect="snowflake")
         _check_table_folding(ast)
+        _check_column_folding(ast)
     except snowflake.connector.errors.ProgrammingError:
         raise
     except Exception as e:  # fail-open: never block a query on a checker limitation
@@ -73,9 +81,51 @@ def _check_table_folding(ast: exp.Expression) -> None:
                     _raise_object_not_found(ref)
 
 
+def _check_column_folding(ast: exp.Expression) -> None:
+    """Detection 2: qualify reports an unresolved column that collides with an
+    available column on a known source case-insensitively but not exactly."""
+    try:
+        qualify(ast.copy(), dialect="snowflake", validate_qualify_columns=True)
+    except OptimizeError as e:
+        match = _UNRESOLVED_COLUMN.search(str(e))
+        if not match:
+            return  # not a column-resolution failure; leave to DuckDB
+        missing = match.group(1) or match.group(2)
+        for columns in _available_columns(ast).values():
+            for column in columns:
+                if missing != column and missing.lower() == column.lower():
+                    _raise_invalid_identifier(missing)
+
+
+def _available_columns(ast: exp.Expression) -> dict[str, set[str]]:
+    """Columns exposed by each non-base-table source (CTE/derived), keyed by source name.
+    Base tables are skipped: their columns are unknown, so qualify treats them as permissive
+    and a missing column there is not a folding collision."""
+    columns: dict[str, set[str]] = {}
+    for scope in traverse_scope(ast):
+        for name, source in scope.sources.items():
+            if isinstance(source, exp.Table):
+                continue
+            inner = getattr(source, "expression", None)
+            if isinstance(inner, exp.Select):
+                # skip unnamed projections (e.g. SELECT *), whose alias_or_name is empty
+                columns.setdefault(name, set()).update(
+                    p.alias_or_name for p in inner.selects if p.alias_or_name
+                )
+    return columns
+
+
 def _raise_object_not_found(ref: str) -> None:
     raise snowflake.connector.errors.ProgrammingError(
         msg=f"SQL compilation error:\nObject '{ref}' does not exist or not authorized.",
         errno=2003,
         sqlstate="42S02",
+    )
+
+
+def _raise_invalid_identifier(ref: str) -> None:
+    raise snowflake.connector.errors.ProgrammingError(
+        msg=f"SQL compilation error: invalid identifier '{ref}'",
+        errno=904,
+        sqlstate="42000",
     )
