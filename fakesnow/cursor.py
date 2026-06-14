@@ -320,7 +320,7 @@ class FakeSnowflakeCursor:
             .transform(transforms.create_clone)
             .transform(transforms.alias_in_join)
             .transform(transforms.alter_table_strip_cluster_by)
-            .transform(transforms.numeric_agg_implicit_cast)
+            .transform(lambda e: transforms.numeric_agg_implicit_cast(e, self._duck_conn))
             .transform(lambda e: transforms.create_stage(e, self._conn.database, self._conn.schema))
             .transform(lambda e: transforms.list_stage(e, self._conn.database, self._conn.schema))
             .transform(lambda e: transforms.put_stage(e, self._conn.database, self._conn.schema, params))

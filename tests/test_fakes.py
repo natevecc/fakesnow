@@ -898,3 +898,16 @@ def test_numeric_aggs_varchar_implicit_cast(dcur: snowflake.connector.cursor.Dic
     assert row["STDDEV_POP(AMOUNT)"] == 81.64965809277261
     assert row["VARIANCE_POP(AMOUNT)"] == 6666.666666666667
     assert row["MEDIAN(AMOUNT)"] == 200.0
+
+
+def test_numeric_aggs_integer_preserves_fixed_shape(dcur: snowflake.connector.cursor.DictCursor):
+    """SUM over an integer column must NOT be demoted to a float: it keeps the
+    fixed/NUMBER wire-shape (scale 0) and full integer precision."""
+    dcur.execute("CREATE TABLE t_int_agg (n BIGINT)")
+    dcur.execute("INSERT INTO t_int_agg VALUES (4611686018427387904), (1), (2)")  # 2**62 + small
+    dcur.execute("SELECT SUM(n) AS total FROM t_int_agg")
+    row = dcur.fetchone()
+    assert row is not None
+    assert row["TOTAL"] == 4611686018427387907  # exact integer, no float rounding
+    assert dcur.description[0].type_code == 0  # 0 == FIXED (NUMBER) in the snowflake connector
+    assert dcur.description[0].scale in (0, None)
