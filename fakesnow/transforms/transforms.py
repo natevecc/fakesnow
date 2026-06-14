@@ -1798,8 +1798,8 @@ def _agg_from_join_tables(select: exp.Select) -> list[exp.Table]:
 def _describe_table_columns(duck_conn: DuckDBPyConnection, table: exp.Table) -> dict[str, str]:
     """Map lowercased column name -> DuckDB type for `table`, via DESCRIBE on the
     bare identifier (alias stripped). Returns {} on any failure (fail-open)."""
-    reference = exp.Table(this=table.this, db=table.args.get("db"), catalog=table.args.get("catalog"))
     try:
+        reference = exp.Table(this=table.this, db=table.args.get("db"), catalog=table.args.get("catalog"))
         rows = duck_conn.execute(f"DESCRIBE {reference.sql(dialect='duckdb')}").fetchall()
     except Exception:
         return {}
@@ -1807,7 +1807,7 @@ def _describe_table_columns(duck_conn: DuckDBPyConnection, table: exp.Table) -> 
 
 
 def _numeric_agg_column_needs_cast(
-    duck_conn: DuckDBPyConnection | None, agg: exp.Expression, column: exp.Column
+    duck_conn: DuckDBPyConnection | None, agg: Expr, column: exp.Column
 ) -> bool:
     """True if `column` is a text type (cast needed) OR cannot be resolved to a
     known numeric base-table column (safe fallback). False only when it resolves
