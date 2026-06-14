@@ -1752,6 +1752,9 @@ _NUMERIC_ONLY_AGGS = (
     exp.Median,
 )
 
+# DuckDB type-name prefixes treated as text; numeric aggregates must cast these.
+_TEXT_COLUMN_PREFIXES = ("VARCHAR", "CHAR", "TEXT", "STRING", "BPCHAR")
+
 
 def _numeric_agg_col_name(expression: Expr, arg: Expr) -> str | None:
     function_name: str | None = None
@@ -1781,15 +1784,64 @@ def _numeric_agg_col_name(expression: Expr, arg: Expr) -> str | None:
     return f"{function_name}({arg.sql(dialect='snowflake').upper()})"
 
 
-def numeric_agg_implicit_cast(expression: Expr) -> Expr:
-    """Wrap arguments to numeric aggregate functions with TRY_CAST(... AS DOUBLE).
+def _agg_from_join_tables(select: exp.Select) -> list[exp.Table]:
+    """The select's OWN FROM + JOIN base tables (version-agnostic arg key;
+    excludes tables nested inside derived subqueries)."""
+    tables: list[exp.Table] = []
+    for value in select.args.values():
+        for node in value if isinstance(value, list) else [value]:
+            if isinstance(node, (exp.From, exp.Join)):
+                tables.extend(t for t in node.find_all(exp.Table) if t.find_ancestor(exp.Select) is select)
+    return tables
 
-    Snowflake implicitly casts VARCHAR to numeric when used in aggregate functions
-    like SUM(), AVG(), MEDIAN(), etc. DuckDB is strict and rejects these. This
-    transform adds an explicit TRY_CAST to match Snowflake's behavior while
-    preserving Snowflake-style column names for rewritten select projections.
 
-    Only applies when the argument is not already a Cast/TryCast expression.
+def _describe_table_columns(duck_conn: DuckDBPyConnection, table: exp.Table) -> dict[str, str]:
+    """Map lowercased column name -> DuckDB type for `table`, via DESCRIBE on the
+    bare identifier (alias stripped). Returns {} on any failure (fail-open)."""
+    reference = exp.Table(this=table.this, db=table.args.get("db"), catalog=table.args.get("catalog"))
+    try:
+        rows = duck_conn.execute(f"DESCRIBE {reference.sql(dialect='duckdb')}").fetchall()
+    except Exception:
+        return {}
+    return {row[0].lower(): row[1] for row in rows}
+
+
+def _numeric_agg_column_needs_cast(
+    duck_conn: DuckDBPyConnection | None, agg: exp.Expression, column: exp.Column
+) -> bool:
+    """True if `column` is a text type (cast needed) OR cannot be resolved to a
+    known numeric base-table column (safe fallback). False only when it resolves
+    to known columns that are all numeric, in which case the native type is
+    preserved. When an unqualified name matches several in-scope tables, any text
+    match wins (casting is always value-safe)."""
+    if duck_conn is None:
+        return True
+    select = agg.find_ancestor(exp.Select)
+    if select is None:
+        return True
+    qualifier = column.table
+    name = column.name.lower()
+    found = False
+    for table in _agg_from_join_tables(select):
+        if qualifier and table.alias_or_name.lower() != qualifier.lower():
+            continue
+        columns = _describe_table_columns(duck_conn, table)
+        if name in columns:
+            found = True
+            if columns[name].upper().startswith(_TEXT_COLUMN_PREFIXES):
+                return True
+    return not found
+
+
+def numeric_agg_implicit_cast(expression: Expr, duck_conn: DuckDBPyConnection | None = None) -> Expr:
+    """Wrap text arguments to numeric aggregate functions with TRY_CAST(... AS DOUBLE).
+
+    Snowflake implicitly casts VARCHAR to numeric for aggregates like SUM(), AVG(),
+    MEDIAN(). DuckDB rejects SUM(VARCHAR), so text columns are cast. Numeric columns
+    are left untouched so their native type and Snowflake wire-shape are preserved
+    (casting a BIGINT to DOUBLE would demote it to a float). When the argument's type
+    cannot be resolved (no connection, CTE/derived source, unknown table) the cast is
+    applied as a safe, value-correct fallback.
 
     Example:
         >>> import sqlglot
@@ -1799,14 +1851,19 @@ def numeric_agg_implicit_cast(expression: Expr) -> Expr:
     if isinstance(expression, _NUMERIC_ONLY_AGGS):
         arg = expression.this
         col_name = None if isinstance(expression.parent, exp.Alias) else _numeric_agg_col_name(expression, arg)
-        # Don't double-cast if already cast, and don't silently demote
-        # integer column types to DOUBLE (breaks Snowflake-compatible SUM(BIGINT)
-        # -> NUMBER(38,0) wire output the Node SDK expects).
-        if not isinstance(arg, (exp.Cast, exp.TryCast, exp.Column)):
-            expression.set(
-                "this",
-                exp.TryCast(this=arg, to=exp.DataType(this=exp.DataType.Type.DOUBLE)),
+        if not isinstance(arg, (exp.Cast, exp.TryCast)):
+            should_cast = (
+                _numeric_agg_column_needs_cast(duck_conn, expression, arg)
+                if isinstance(arg, exp.Column)
+                else True
             )
+            if should_cast:
+                expression.set(
+                    "this",
+                    exp.TryCast(this=arg, to=exp.DataType(this=exp.DataType.Type.DOUBLE)),
+                )
+        # The Snowflake-style projection name is preserved whether or not a cast was
+        # applied, so numeric-aggregate columns keep their uppercase SUM(N)-style name.
         if col_name and isinstance(expression.parent, exp.Select):
             return exp.alias_(expression, col_name, quoted=True)
     return expression

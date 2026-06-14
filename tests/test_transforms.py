@@ -1148,3 +1148,45 @@ def test_numeric_agg_implicit_cast() -> None:
         == 'SELECT STDDEV_SAMP(TRY_CAST(amount AS DOUBLE)) AS "STDDEV_SAMP(AMOUNT)", '
         'VARIANCE_POP(TRY_CAST(amount AS DOUBLE)) AS "VARIANCE_POP(AMOUNT)" FROM t'
     )
+
+
+def test_numeric_agg_implicit_cast_type_aware() -> None:
+    import duckdb
+
+    from fakesnow.transforms.transforms import numeric_agg_implicit_cast
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t_txt (amount VARCHAR, k INTEGER)")
+    con.execute("CREATE TABLE t_num (n BIGINT, m INTEGER, f DOUBLE, k INTEGER)")
+    con.execute("CREATE TABLE t_mix (amount INTEGER, j INTEGER)")
+
+    def rendered(sql: str) -> str:
+        return (
+            sqlglot.parse_one(sql, read="snowflake")
+            .transform(lambda e: numeric_agg_implicit_cast(e, con))
+            .sql(dialect="duckdb")
+        )
+
+    # text column -> cast so DuckDB can aggregate it
+    assert "TRY_CAST(amount AS DOUBLE)" in rendered("SELECT SUM(amount) FROM t_txt")
+    # numeric columns -> NOT cast (native type / wire-shape preserved), but the
+    # Snowflake-style projection name is still applied regardless of casting.
+    assert rendered("SELECT SUM(n) FROM t_num") == 'SELECT SUM(n) AS "SUM(N)" FROM t_num'
+    assert "TRY_CAST" not in rendered("SELECT AVG(m) FROM t_num")
+    assert "TRY_CAST" not in rendered("SELECT SUM(f) FROM t_num")
+    # qualified numeric column -> not cast
+    assert "TRY_CAST" not in rendered("SELECT SUM(t.n) FROM t_num t")
+    # unknown/unresolvable -> safe fallback cast
+    assert "TRY_CAST(x AS DOUBLE)" in rendered("SELECT SUM(x) FROM nope")
+    # ambiguous unqualified name across a join: any text match wins (cast is value-safe)
+    assert "TRY_CAST(amount AS DOUBLE)" in rendered(
+        "SELECT SUM(amount) FROM t_mix JOIN t_txt ON t_mix.j = t_txt.k"
+    )
+    # name numeric in every joined table -> not cast
+    assert "TRY_CAST" not in rendered("SELECT SUM(k) FROM t_txt JOIN t_num ON t_txt.k = t_num.k")
+
+    # no connection -> legacy fallback (cast all bare columns)
+    assert (
+        sqlglot.parse_one("SELECT SUM(amount) FROM t").transform(numeric_agg_implicit_cast).sql()
+        == 'SELECT SUM(TRY_CAST(amount AS DOUBLE)) AS "SUM(AMOUNT)" FROM t'
+    )
