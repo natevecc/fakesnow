@@ -1391,6 +1391,34 @@ def trim_cast_varchar(expression: Expr) -> Expr:
     )
 
 
+def width_bucket(expression: Expr) -> Expr:
+    """Rewrite WIDTH_BUCKET as CASE/FLOOR arithmetic; DuckDB has no WIDTH_BUCKET.
+
+    Matches Snowflake semantics for ascending bounds: 0 below the range,
+    num_buckets + 1 at/above the upper bound, else 1-based uniform bucket.
+
+    Example:
+        >>> import sqlglot
+        >>> sqlglot.parse_one("select width_bucket(a, 0, 100, 10) from t", read="snowflake").transform(width_bucket).sql(dialect="duckdb")
+        'SELECT CASE WHEN a IS NULL THEN NULL WHEN a < 0 THEN 0 WHEN a >= 100 THEN 10 + 1 ELSE CAST(FLOOR((a - 0) * 10 / (100 - 0)) AS BIGINT) + 1 END FROM t'
+    """
+    if not isinstance(expression, exp.WidthBucket):
+        return expression
+
+    v = expression.this.sql(dialect="duckdb")
+    lo = expression.args["min_value"].sql(dialect="duckdb")
+    hi = expression.args["max_value"].sql(dialect="duckdb")
+    n = expression.args["num_buckets"].sql(dialect="duckdb")
+
+    return sqlglot.parse_one(
+        f"CASE WHEN {v} IS NULL THEN NULL "
+        f"WHEN {v} < {lo} THEN 0 "
+        f"WHEN {v} >= {hi} THEN {n} + 1 "
+        f"ELSE CAST(FLOOR(({v} - {lo}) * {n} / ({hi} - {lo})) AS BIGINT) + 1 END",
+        read="duckdb",
+    )
+
+
 def try_parse_json(expression: Expr) -> Expr:
     """Convert TRY_PARSE_JSON() to TRY_CAST(... as JSON).
 

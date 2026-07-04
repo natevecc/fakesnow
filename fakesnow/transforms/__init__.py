@@ -81,4 +81,5 @@ from fakesnow.transforms.transforms import (
     update_variables as update_variables,
     upper_case_unquoted_identifiers as upper_case_unquoted_identifiers,
     values_columns as values_columns,
+    width_bucket as width_bucket,
 )
